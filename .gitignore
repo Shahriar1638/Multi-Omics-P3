@@ -1,0 +1,3 @@
+# Ignore dataset folders and their contents
+NewDatasets/
+RawData/
