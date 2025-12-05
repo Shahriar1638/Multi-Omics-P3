@@ -827,22 +827,6 @@ def plot_ensemble_comparison(results_df, save_path=None):
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Figure saved to {save_path}")
-    
-    plt.show()
-
-
-# ==============================================================================
-# MAIN EXECUTION EXAMPLE
-# ==============================================================================
-
-if __name__ == "__main__":
-    # Example usage
-    print("="*60)
-    print("ENSEMBLE MODULE - Example Usage")
-    print("="*60)
-    
     # Generate sample data
     from sklearn.datasets import make_classification
     X, y = make_classification(n_samples=500, n_features=50, n_informative=20,
