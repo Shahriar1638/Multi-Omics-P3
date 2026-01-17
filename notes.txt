@@ -1,0 +1,204 @@
+.env\Scripts\activate.bat
+
+Iteration 206: time=6.01, ELBO=-88531498.67, deltaELBO=66.747 (0.00000468%), Factors=14
+- ELBO decomposition:  Z=-12800.29  W=-5309500.47  Tau=-3863949.96  Y=-79342969.09  AlphaZ=-463.03  AlphaW=-1521.58  ThetaZ=-53.58  ThetaW=-240.67  
+- Time spent in ELBO computation: 9.1%
+- Variance explained:  View 0: 25.45%   View 1: 43.27%   View 2: 51.00%
+- Fraction of zero weights:  View 0: 28%   View 1: 24%   View 2: 20%
+- Maximum correlation between factors: 0.30
+- Factor norms:  2.80 3.03 2.89 1.45 1.71 1.40 1.17 0.98 2.46 2.18 0.26 0.25 0.12 0.27
+- Tau per view (average):  View 0: 61.42   View 1: 7.84   View 2: 2.37
+
+
+Iteration 207: time=5.92, ELBO=-88531436.51, deltaELBO=62.163 (0.00000436%), Factors=14
+- ELBO decomposition:  Z=-12800.31  W=-5309333.89  Tau=-3863949.95  Y=-79343073.51  AlphaZ=-463.03  AlphaW=-1521.58  ThetaZ=-53.54  ThetaW=-240.70  
+- Time spent in ELBO computation: 9.0%
+
+Converged!
+
+
+
+#######################
+## Training finished ##
+#######################
+
+
+Factors shape (183, 14)
+Weights shape (view0): (44663, 14)
+Weights shape (view1): (396650, 14)
+Weights shape (view2): (56756, 14)
+Factor norms: [22.62288483 23.53850621 22.99078659 16.2745182  17.66870931 15.99620309
+ 14.60797307 13.38620542 21.20782716 19.96986533  6.83706065  6.73338338
+  4.70133196  7.06377632]
+Active factors: 14 / 14
+🔍 MOFA CLUSTER QUALITY EVALUATION
+==================================================
+
+📊 INTERNAL CLUSTERING METRICS:
+------------------------------
+Silhouette Score: 0.1431
+Calinski-Harabasz Score: 31.1127
+Davies-Bouldin Score: 1.9986
+
+🎯 EXTERNAL VALIDATION METRICS:
+------------------------------
+Adjusted Rand Index: 0.2870
+Normalized Mutual Information: 0.2375
+Adjusted Mutual Information: 0.2293
+Homogeneity: 0.2463
+Completeness: 0.2293
+V-measure: 0.2375
+
+📈 CLUSTER COMPOSITION ANALYSIS:
+------------------------------
+Contingency Matrix (True Labels vs Predicted Clusters):
+[[19  6 28]
+ [16 68 12]
+ [22  1 11]]
+
+Cluster Purity: 0.6448
+
+🔬 MOFA FACTOR QUALITY METRICS:
+------------------------------
+Factor Variance Explained (%):
+  Factor 1: 13.35%
+  Factor 2: 14.46%
+  Factor 3: 13.79%
+  Factor 4: 6.91%
+  Factor 5: 8.15%
+  Factor 6: 6.68%
+  Factor 7: 5.57%
+  Factor 8: 4.68%
+  Factor 9: 11.74%
+  Factor 10: 10.40%
+  Factor 11: 1.22%
+  Factor 12: 1.18%
+  Factor 13: 0.58%
+  Factor 14: 1.30%
+
+Top 5 factors explain: 56.66% of variance
+Mean Inter-cluster Distance: 3.9955
+
+🏆 OVERALL QUALITY SUMMARY:
+------------------------------
+Composite Quality Score: 0.3055
+Overall Rating: Fair
+
+💡 INTERPRETATION GUIDE:
+- Silhouette Score: >0.7=Excellent, 0.5-0.7=Good, 0.25-0.5=Fair, <0.25=Poor
+- ARI: >0.9=Excellent, 0.8-0.9=Good, 0.6-0.8=Fair, <0.6=Poor
+- NMI: >0.9=Excellent, 0.7-0.9=Good, 0.5-0.7=Fair, <0.5=Poor
+
+Running Patient Manifold Learning & Diffusion Steps...
+Computed Normalized Laplacian L_norm.
+
+Running Class Prototype Diffusion...
+
+1. Naive Class Prototypes (Centroids in Latent Space):
+   Class 0: Computed centroid from 53 patients.
+   Class 1: Computed centroid from 96 patients.
+   Class 2: Computed centroid from 34 patients.
+   Computing Matrix Exponential (Heat Kernel) with alpha=0.5...
+   Computing Random Walk Diffusion with alpha=0.8...
+
+3. Interpretation of Diffused Prototypes:
+   The diffused signals represent the 'influence' of each class prototype on every patient.
+   This respects the manifold structure of the patient graph.
+   Class 0 (Original Size: 53):
+     - Total Influence Mass (Original): 53.00
+     - Total Influence Mass (Diffused): 266.30
+     - Effective Reach (>0.001 signal): 183 patients
+   Class 1 (Original Size: 96):
+     - Total Influence Mass (Original): 96.00
+     - Total Influence Mass (Diffused): 480.71
+     - Effective Reach (>0.001 signal): 183 patients
+   Class 2 (Original Size: 34):
+     - Total Influence Mass (Original): 34.00
+     - Total Influence Mass (Diffused): 167.99
+     - Effective Reach (>0.001 signal): 183 patients
+
+   (Optional) Smoothing Latent Factors via Random Walk:
+
+Running Classification with Diffused Prototypes...
+
+Computing Diffused Prototypes (Weighted Centroids):
+   Class 0: Prototype shifted by 0.7343 in latent space.
+   Class 1: Prototype shifted by 0.4313 in latent space.
+   Class 2: Prototype shifted by 0.7809 in latent space.
+
+Re-classification Consistency (vs Original Labels): 74.8634%
+   Patients re-assigned to different class: 46 / 183
+
+Sample Probabilities (First 5 patients):
+   Prob_0  Prob_1  Prob_2
+0  0.4964  0.1701  0.3335
+1  0.3943  0.4186  0.1871
+2  0.3891  0.3788  0.2321
+3  0.3143  0.2784  0.4073
+4  0.3544  0.4493  0.1962
+
+Interpretability & Analysis:
+Dominant Factors per Diffused Prototype:
+   Class 0: Top Factors [1 3 8] (Values: [-0.609  0.607  0.433])
+   Class 1: Top Factors [3 1 2] (Values: [-0.541  0.51  -0.371])
+   Class 2: Top Factors [0 2 3] (Values: [-1.037  0.641  0.595])
+
+==================================================
+HYPERPARAMETER TUNING (GRID SEARCH)
+==================================================
+Metric     | k     | Alpha | Acc      | Mac-F1   | Recall
+-----------------------------------------------------------------
+euclidean  | 5     | 0.1   | 0.7545   | 0.7281   | 0.7529
+euclidean  | 5     | 0.5   | 0.7323   | 0.6940   | 0.7120
+euclidean  | 5     | 0.8   | 0.7101   | 0.6714   | 0.6859
+euclidean  | 5     | 0.99  | 0.6719   | 0.6354   | 0.6582
+euclidean  | 10    | 0.1   | 0.7491   | 0.7244   | 0.7494
+euclidean  | 10    | 0.5   | 0.7216   | 0.6899   | 0.7110
+euclidean  | 10    | 0.8   | 0.6884   | 0.6579   | 0.6753
+euclidean  | 10    | 0.99  | 0.6505   | 0.6164   | 0.6425
+euclidean  | 15    | 0.1   | 0.7491   | 0.7244   | 0.7494
+euclidean  | 15    | 0.5   | 0.7161   | 0.6856   | 0.7076
+euclidean  | 15    | 0.8   | 0.6884   | 0.6603   | 0.6815
+euclidean  | 15    | 0.99  | 0.6560   | 0.6219   | 0.6520
+cosine     | 5     | 0.1   | 0.7545   | 0.7281   | 0.7529
+cosine     | 5     | 0.5   | 0.7380   | 0.7034   | 0.7247
+cosine     | 5     | 0.8   | 0.7321   | 0.7021   | 0.7227
+cosine     | 5     | 0.99  | 0.6608   | 0.6188   | 0.6448
+cosine     | 10    | 0.1   | 0.7491   | 0.7244   | 0.7494
+cosine     | 10    | 0.5   | 0.7326   | 0.7028   | 0.7237
+cosine     | 10    | 0.8   | 0.7212   | 0.6959   | 0.7169
+cosine     | 10    | 0.99  | 0.6503   | 0.6136   | 0.6419
+cosine     | 15    | 0.1   | 0.7491   | 0.7244   | 0.7494
+cosine     | 15    | 0.5   | 0.7216   | 0.6917   | 0.7143
+cosine     | 15    | 0.8   | 0.7050   | 0.6799   | 0.7038
+cosine     | 15    | 0.99  | 0.6503   | 0.6127   | 0.6447
+-----------------------------------------------------------------
+🏆 Best Parameters (Macro F1): {'metric': 'euclidean', 'k': 5, 'alpha': 0.1}
+   Best Score: 0.7281
+
+==================================================
+FINAL EVALUATION & INTERPRETATION
+==================================================
+Using Best Parameters: {'metric': 'euclidean', 'k': 5, 'alpha': 0.1}
+
+1. Classification Report (Test Set):
+              precision    recall  f1-score   support
+
+           0       0.71      0.91      0.80        11
+           1       0.93      0.74      0.82        19
+           2       0.50      0.57      0.53         7
+
+    accuracy                           0.76        37
+   macro avg       0.72      0.74      0.72        37
+weighted avg       0.79      0.76      0.76        37
+
+Overall Accuracy: 0.7568
+AUROC (Macro Average): 0.8851
+
+Confusion Matrix:
+[[10  0  1]
+ [ 2 14  3]
+ [ 2  1  4]]
+
+2. Rare Class Evaluation (<10 patients in total cohort):
+No classes with <10 patients found.

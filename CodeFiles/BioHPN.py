@@ -232,17 +232,10 @@ class EarlyStopping:
 # ==========================================
 # 6. TRAINING ENGINE
 # ==========================================
-def run_architect_pipeline():
-    # Check CUDA availability
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n{'='*60}")
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print(f"{'='*60}\n")
-    
-    # Load real datasets
+def load_and_match_data():
+    """
+    Load and match all datasets once
+    """
     print("--- Loading Real Datasets ---")
     gene_df = pd.read_csv("../NewDatasets/processed_expression_4O.csv", index_col=0).T
     meth_df = pd.read_csv("../NewDatasets/processed_methylation_4O.csv", index_col=0).T
@@ -254,6 +247,42 @@ def run_architect_pipeline():
     gene_matched, meth_matched, cnv_matched, labels_matched = match_samples(
         gene_df, meth_df, cnv_df, phenotype_df, labels_df
     )
+    return gene_matched, meth_matched, cnv_matched, labels_matched
+
+def filter_omics_by_variance(gene_df, meth_df, cnv_df, variance_pct):
+    """
+    Select top variance_pct features for each omics type
+    """
+    print(f"\nFiltering top {int(variance_pct*100)}% features by variance...")
+    
+    def filter_df(df, name):
+         variances = df.var()
+         n_features = len(df.columns)
+         n_keep = int(n_features * variance_pct)
+         # If n_keep is 0 (unlikely but possible for very small dfs), keep at least 1
+         n_keep = max(1, n_keep)
+         
+         top_features = variances.nlargest(n_keep).index
+         print(f"  {name}: {n_features} -> {n_keep} features")
+         return df[top_features]
+
+    g_filt = filter_df(gene_df, "Gene")
+    m_filt = filter_df(meth_df, "Meth")
+    c_filt = filter_df(cnv_df, "CNV")
+    
+    return g_filt, m_filt, c_filt
+
+def run_architect_pipeline(gene_matched, meth_matched, cnv_matched, labels_matched):
+    # Check CUDA availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n{'='*60}")
+    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print(f"{'='*60}\n")
+    
+    # Create dataset with matched samples
     
     # Create dataset with matched samples
     dataset = RealBioDataset(gene_matched, meth_matched, cnv_matched, labels_matched)
@@ -337,6 +366,7 @@ def run_architect_pipeline():
         # ===== VALIDATION =====
         model.eval()
         val_clf, val_aln = 0, 0
+        val_correct, val_total = 0, 0
         with torch.no_grad():
             for rna, meth, cnv, labels in val_loader:
                 # Move data to GPU
@@ -349,8 +379,14 @@ def run_architect_pipeline():
                 val_loss = (clf_weight * clf_loss) + (align_weight * align_loss)
                 val_clf += clf_loss.item()
                 val_aln += align_loss.item()
+                
+                # Calculate accuracy
+                predictions = torch.argmax(logits, dim=1)
+                val_correct += (predictions == labels).sum().item()
+                val_total += labels.size(0)
         
         val_total_loss = val_clf + val_aln
+        val_accuracy = 100.0 * val_correct / val_total
         
         # Step the scheduler
         scheduler.step()
@@ -360,7 +396,7 @@ def run_architect_pipeline():
             current_lr = scheduler.get_last_lr()[0]
             print(f"Epoch {epoch:03d} | LR: {current_lr:.6f} | Scale: {model.logit_scale.exp().item():.2f}")
             print(f"  Train - Clf: {t_clf/len(train_loader):.4f} | Align: {t_aln/len(train_loader):.4f}")
-            print(f"  Val   - Clf: {val_clf/len(val_loader):.4f} | Align: {val_aln/len(val_loader):.4f} | Total: {val_total_loss:.4f}")
+            print(f"  Val   - Clf: {val_clf/len(val_loader):.4f} | Align: {val_aln/len(val_loader):.4f} | Total: {val_total_loss:.4f} | Acc: {val_accuracy:.2f}%")
         
         # Early stopping check
         early_stopping(val_total_loss, model)
@@ -371,7 +407,22 @@ def run_architect_pipeline():
             break
     
     print(f"\nTraining completed! Best validation loss: {early_stopping.best_loss:.4f}")
-    return model, train_loader, val_loader, device
+    
+    # Calculate final validation accuracy with best model
+    model.eval()
+    final_val_correct, final_val_total = 0, 0
+    with torch.no_grad():
+        for rna, meth, cnv, labels in val_loader:
+            rna, meth, cnv, labels = rna.to(device), meth.to(device), cnv.to(device), labels.to(device)
+            logits, _, _ = model(rna, meth, cnv)
+            predictions = torch.argmax(logits, dim=1)
+            final_val_correct += (predictions == labels).sum().item()
+            final_val_total += labels.size(0)
+    
+    final_val_accuracy = 100.0 * final_val_correct / final_val_total
+    print(f"Final Validation Accuracy: {final_val_accuracy:.2f}% ({final_val_correct}/{final_val_total})")
+    
+    return model, train_loader, val_loader, device, final_val_accuracy
 
 def visualize_results(model, loader, device, title="Bio-HPN: Latent Space"):
     model.eval()
@@ -404,8 +455,43 @@ def visualize_results(model, loader, device, title="Bio-HPN: Latent Space"):
     plt.show()
 
 if __name__ == "__main__":
-    trained_model, train_loader, val_loader, device = run_architect_pipeline()
-    print("\nVisualizing Training Data:")
-    visualize_results(trained_model, train_loader, device, "Bio-HPN: Training Set Latent Space")
-    print("\nVisualizing Validation Data:")
-    visualize_results(trained_model, val_loader, device, "Bio-HPN: Validation Set Latent Space")
+    # Load data once
+    gene_full, meth_full, cnv_full, labels_full = load_and_match_data()
+    
+    # Variances to experiment with
+    variances = [0.3, 0.4, 0.5, 0.6, 0.7]
+    experiment_results = []
+    
+    for v in variances:
+        print(f"\n\n{'#'*60}")
+        print(f"EXPERIMENT: TOP {int(v*100)}% VARIANCE")
+        print(f"{'#'*60}")
+        
+        # Filter data
+        g_v, m_v, c_v = filter_omics_by_variance(gene_full, meth_full, cnv_full, v)
+        
+        # Run pipeline
+        trained_model, train_loader, val_loader, device, acc = run_architect_pipeline(g_v, m_v, c_v, labels_full)
+        
+        # Store results
+        experiment_results.append({
+            "Variance Used": f"{int(v*100)}%",
+            "Accuracy": f"{acc:.2f}%",
+            "RNA Dim": g_v.shape[1],
+            "Meth Dim": m_v.shape[1],
+            "CNV Dim": c_v.shape[1]
+        })
+        
+        # Visualize
+        print(f"\nVisualizing Results for {int(v*100)}% Variance:")
+        visualize_results(trained_model, val_loader, device, title=f"HPN Latent Space (Top {int(v*100)}% Var) - Acc: {acc:.2f}%")
+
+    # Display Final Comparison Table
+    print("\n\n" + "="*60)
+    print("FINAL EXPERIMENT RESULTS: VARIANCE COMPARISON")
+    print("="*60)
+    results_df = pd.DataFrame(experiment_results)
+    
+    # Simple table print
+    print(results_df.to_string(index=False))
+    print("="*60)

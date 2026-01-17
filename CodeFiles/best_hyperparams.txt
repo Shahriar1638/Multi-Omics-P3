@@ -1,0 +1,16 @@
+Best Hyperparameters from Optuna Optimization
+==================================================
+
+Best Balanced Accuracy: 0.7825
+
+Hyperparameters:
+  latent_dim: 128
+  hidden_dim: 512
+  attn_hidden: 64
+  dropout: 0.2
+  weight_decay: 0.016982911605413042
+  l1_lambda: 0.002252805299247575
+  label_smoothing: 0.05
+  learning_rate: 0.008458927314426304
+  batch_size: 64
+  use_batch_norm: True
