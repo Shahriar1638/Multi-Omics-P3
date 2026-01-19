@@ -1,4 +1,3 @@
 # Ignore dataset folders and their contents
-NewDatasets/
+Data/
 RawData/
-Prototypical-Networks-for-Few-shot-Learning-PyTorch/
