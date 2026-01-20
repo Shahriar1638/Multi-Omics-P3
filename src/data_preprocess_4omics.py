@@ -92,7 +92,8 @@ subtype_column = 'primary_diagnosis.diagnoses'
 selected_subtypes = [
     'Leiomyosarcoma, NOS',
     'Dedifferentiated liposarcoma',
-    'Undifferentiated sarcoma'
+    'Undifferentiated sarcoma',
+    'Fibromyxosarcoma'
 ]
 
 print(f"Target column: '{subtype_column}'")

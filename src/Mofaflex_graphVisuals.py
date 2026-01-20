@@ -30,7 +30,7 @@ RESULTS_DIR = "Results_Mofaflex"
 GRAPH_OUTPUT_DIR = os.path.join(RESULTS_DIR, "Graphs")
 os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 
-FEATURE_COUNTS = [2000, 4000, 6000]
+FEATURE_COUNTS = [2000, 4000, 6000, 10000]
 K_NEIGHBORS = 10  # k for KNN
 RANDOM_STATE = 42
 

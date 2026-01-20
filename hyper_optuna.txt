@@ -1,0 +1,11 @@
+1. use SimpleImputer(strategy='median')
+2. instead of nn.CrossEntropyLoss() use Inverse Frequency Class Weights here is an dummy example : # Inside run_cv_evaluation, after y_tr is defined:
+from sklearn.utils.class_weight import compute_class_weight
+
+# Calculate weights based on training labels only (to avoid leakage)
+weights = compute_class_weight(
+    class_weight='balanced', 
+    classes=np.unique(Y[train_idx]), 
+    y=Y[train_idx]
+)
+class_weights = torch.FloatTensor(weights).to(DEVICE)

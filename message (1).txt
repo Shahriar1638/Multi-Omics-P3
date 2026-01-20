@@ -1,0 +1,137 @@
+import sys
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import StratifiedKFold
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+import optuna
+
+# ==========================================
+# 0. CONFIGURATION & DEVICE
+# ==========================================
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f">>> Running on: {DEVICE}")
+
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+FEATURE_COUNTS = [2000, 3000, 5000]
+SUBTYPES_OF_INTEREST = [
+    'Leiomyosarcoma, NOS',
+    'Dedifferentiated liposarcoma',
+    'Undifferentiated sarcoma',
+    'Fibromyxosarcoma'
+]
+N_TRIALS = 15
+
+# ==========================================
+# 1. INTEGRATED ARCHITECTURE
+# ==========================================
+
+class OmicsEncoder(nn.Module):
+    """Modular encoder per modality for transparency."""
+    def __init__(self, input_dim, hidden_dims, latent_dim, dropout):
+        super().__init__()
+        layers = []
+        prev = input_dim
+        for h in hidden_dims:
+            layers.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)])
+            prev = h
+        self.net = nn.Sequential(*layers)
+        self.latent = nn.Linear(prev, latent_dim)
+
+    def forward(self, x):
+        return self.latent(self.net(x))
+
+class HyperDNN(nn.Module):
+    """Supervised Multi-Task Omics Model."""
+    def __init__(self, input_dims, num_classes, latent_dim, encoder_hidden_dims, dropout):
+        super().__init__()
+        self.omics_names = list(input_dims.keys())
+        # Independent Encoders for Explainability
+        self.encoders = nn.ModuleDict({
+            n: OmicsEncoder(input_dims[n], encoder_hidden_dims, latent_dim, dropout) for n in self.omics_names
+        })
+        # Simple Linear Decoders for Reconstruction
+        self.decoders = nn.ModuleDict({
+            n: nn.Linear(latent_dim, input_dims[n]) for n in self.omics_names
+        })
+        # Integrated Classification Head
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim * len(self.omics_names), 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, inputs):
+        z_dict = {n: self.encoders[n](inputs[n]) for n in self.omics_names}
+        recons = {n: self.decoders[n](z_dict[n]) for n in self.omics_names}
+        fused = torch.cat([z_dict[n] for n in self.omics_names], dim=1)
+        return recons, self.classifier(fused), z_dict
+
+# ==========================================
+# 2. CROSS-VALIDATION PIPELINE
+# ==========================================
+
+def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, num_classes, is_optuna=True):
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_metrics = {'f1_macro': [], 'accuracy': []}
+    
+    alpha = params.get('alpha', 0.5) # Balance recon vs classification
+    
+    for train_idx, val_idx in kf.split(rna_df, Y):
+        # 1. Split & Local Preprocessing (Prevents Leakage)
+        def process_modality(train, val, k):
+            imp = SimpleImputer(strategy='median')
+            sc = StandardScaler()
+            tr_imp = imp.fit_transform(train)
+            val_imp = imp.transform(val)
+            # Variance filter
+            var = np.var(tr_imp, axis=0)
+            idx = np.argpartition(var, -k)[-k:]
+            return sc.fit_transform(tr_imp[:, idx]), sc.transform(val_imp[:, idx])
+
+        tr_r, val_r = process_modality(rna_df.iloc[train_idx], rna_df.iloc[val_idx], n_features)
+        tr_m, val_m = process_modality(meth_df.iloc[train_idx], meth_df.iloc[val_idx], n_features)
+        tr_c, val_c = process_modality(cnv_df.iloc[train_idx], cnv_df.iloc[val_idx], n_features)
+
+        # 2. Prepare Tensors
+        in_tr = {'RNA': torch.FloatTensor(tr_r).to(DEVICE), 'Meth': torch.FloatTensor(tr_m).to(DEVICE), 'CNV': torch.FloatTensor(tr_c).to(DEVICE), 'y': torch.LongTensor(Y[train_idx]).to(DEVICE)}
+        in_val = {'RNA': torch.FloatTensor(val_r).to(DEVICE), 'Meth': torch.FloatTensor(val_m).to(DEVICE), 'CNV': torch.FloatTensor(val_c).to(DEVICE), 'y': torch.LongTensor(Y[val_idx]).to(DEVICE)}
+        
+        dims = {'RNA': tr_r.shape[1], 'Meth': tr_m.shape[1], 'CNV': tr_c.shape[1]}
+        model = HyperDNN(dims, num_classes, params['latent_dim'], [128, 64], params['dropout']).to(DEVICE)
+        optimizer = optim.AdamW(model.parameters(), lr=params['lr'])
+        
+        # 3. Multi-Task Training Loop
+        for epoch in range(100):
+            model.train()
+            optimizer.zero_grad()
+            recons, logits, _ = model(in_tr)
+            # Dual Loss
+            loss_recon = sum(F.mse_loss(recons[n], in_tr[n]) for n in dims)
+            loss_class = F.cross_entropy(logits, in_tr['y'])
+            loss = (alpha * loss_class) + ((1 - alpha) * loss_recon)
+            loss.backward(); optimizer.step()
+
+        # 4. Evaluation
+        model.eval()
+        with torch.no_grad():
+            _, logits_v, _ = model(in_val)
+            preds = logits_v.argmax(1).cpu().numpy()
+            targets = in_val['y'].cpu().numpy()
+            fold_metrics['f1_macro'].append(f1_score(targets, preds, average='macro'))
+            fold_metrics['accuracy'].append(accuracy_score(targets, preds))
+
+    return np.mean(fold_metrics['f1_macro']) if is_optuna else {k: np.mean(v) for k, v in fold_metrics.items()}
+
+# [Remaining loading logic and Optuna loop would go here, optimized for the new objective]
