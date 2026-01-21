@@ -1,0 +1,23 @@
+{
+    "n_features": 1200,
+    "best_f1_macro": 0.7271578728002877,
+    "latent_dim": 32,
+    "hidden_dim": 128,
+    "fusion_hidden_dim": 64,
+    "lr_pre": 0.0015373753588484038,
+    "lr_fine": 7.394110328059362e-05,
+    "dropout_rate": 0.16571889793448413,
+    "dropout_encoder": 0.030237293242188417,
+    "weight_decay": 9.352619549147827e-05,
+    "noise_level": 0.18951271760074628,
+    "noise_type": "uniform",
+    "focal_gamma": 3.2489692517094646,
+    "focal_alpha_scale": 1.8847970326423253,
+    "use_class_weights": true,
+    "max_rel_gap_pre": 0.4633819204024824,
+    "max_rel_gap_fine": 0.5162358143720709,
+    "overfit_patience": 14,
+    "no_improve_patience": 32,
+    "ntxent_temperature": 0.7010496986436012,
+    "ntxent_weight": 4.409946094858267
+}

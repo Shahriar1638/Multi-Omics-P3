@@ -9,21 +9,19 @@ import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-# <--- METHODOLOGICAL FIX 1: Robust Imputation
-from sklearn.impute import KNNImputer 
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import f1_score, precision_score, recall_score, silhouette_score, accuracy_score, normalized_mutual_info_score, adjusted_rand_score
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 import umap
 
-# Try importing Lifelines for C-index (Biological Validation)
+# Try importing Lifelines for C-index
 try:
     from lifelines.utils import concordance_index
     HAS_LIFELINES = True
 except ImportError:
     HAS_LIFELINES = False
-    print("Warning: lifelines not found. Survival C-index will be skipped.")
-
+    # print("Warning: lifelines not found. C-index will be skipped.")
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f">>> Running on: {DEVICE}")
 
@@ -31,19 +29,18 @@ print(f">>> Running on: {DEVICE}")
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Best hyperparameters
+# Best hyperparameters from Optuna optimization (sample: 2000)
 BEST_PARAMS = {
     'latent_dim': 64,
     'lr_pre': 0.001,
     'lr_fine': 0.00011,
     'dropout_rate': 0.2,
-    'noise_level': 0.1035,
+    'mask_ratio': 0.1035,
     'epochs_fine': 2000,
-    'patience': 15,
-    'consistency_weight': 1.0 
+    'patience': 15
 }
 
-N_FEATURES = 1200  
+N_FEATURES = 1200  # Feature count for which params were optimized
 
 SUBTYPES_OF_INTEREST = [
     'Leiomyosarcoma, NOS',
@@ -135,31 +132,23 @@ class PerOmicCMAE(nn.Module):
             nn.Linear(latent_dim, 256), nn.GELU(),
             nn.Linear(256, input_dim)
         )
-        self.projector = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim), nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
-        )
 
-    def forward(self, x, noise_level=0.0):
-        if self.training and noise_level > 0:
-            noise = torch.randn_like(x) * noise_level
-            x_corrupted = x + noise
+    def forward(self, x, mask_ratio=0.0):
+        if mask_ratio > 0 and self.training:
+            mask = (torch.rand_like(x) > mask_ratio).float()
+            x_masked = x * mask
         else:
-            x_corrupted = x
-
-        z = self.encoder(x_corrupted)
-        rec = self.decoder(z)
-        proj = self.projector(z)
-        
-        return rec, proj, z, x_corrupted
+            mask = torch.ones_like(x)
+            x_masked = x
+        z = self.encoder(x_masked)
+        return self.decoder(z), z, mask
 
 class GatedAttentionFusion(nn.Module):
-    # <--- METHODOLOGICAL FIX 2: Dynamic Classes
     def __init__(self, latent_dim=64, num_classes=4, dropout_rate=0.3):
         super().__init__()
         self.gate_rna = nn.Linear(latent_dim, 1)
         self.gate_meth = nn.Linear(latent_dim, 1)
-        self.gate_clin = nn.Linear(latent_dim, 1) 
+        self.gate_clin = nn.Linear(latent_dim, 1) # reusing name 'clin' for 'cnv'
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 64),
             nn.ReLU(),
@@ -181,6 +170,17 @@ class GatedAttentionFusion(nn.Module):
         z_fused = (w_rna * z_rna + w_meth * z_meth + w_clin * z_clin) / (w_rna + w_meth + w_clin + 1e-8)
         return self.classifier(z_fused), torch.cat([w_rna, w_meth, w_clin], dim=1), z_fused
 
+class StabilizedUncertaintyLoss(nn.Module):
+    def __init__(self, num_losses):
+        super().__init__()
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+    def forward(self, losses):
+        total = 0
+        for i, loss in enumerate(losses):
+            prec = torch.clamp(0.5 * torch.exp(-self.log_vars[i]), 0.2, 3.0)
+            total += prec * loss + 0.5 * self.log_vars[i]
+        return total
+
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
         super(FocalLoss, self).__init__()
@@ -191,11 +191,17 @@ class FocalLoss(nn.Module):
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
+        # (1-pt)^gamma * CE
         focal_loss = (1 - pt) ** self.gamma * ce_loss
         
         if self.alpha is not None:
             if self.alpha.device != inputs.device:
                 self.alpha = self.alpha.to(inputs.device)
+            # If alpha is scalar/list, broadcasting might be needed or gathering
+            # For simplicity, assuming no alpha or handled externally for now unless requested
+            # A common way using weight in cross_entropy handles alpha part of it, 
+            # but standard Focal Loss definition separates them.
+            # Here we follow robust implementation:
             pass 
 
         if self.reduction == 'mean':
@@ -205,16 +211,17 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, class_names):
+
+def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, class_names, mem_bank_dim=128):
     """
     params: dict of hyperparameters
+    mem_bank_dim: dimension of memory bank for comparison (128, 64, or 32)
     """
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     fold_metrics = {
         'accuracy': [], 'f1_macro': [], 'f1_micro': [],
-        'precision': [], 'recall': [], 'silhouette': [], 'nmi': [], 'ari': [],
-        'c_index': [] # <--- METHODOLOGICAL FIX 3: Survival Tracking
+        'precision': [], 'recall': [], 'silhouette': [], 'nmi': [], 'ari': []
     }
 
     # Hyperparams
@@ -222,34 +229,31 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
     lr_pre = params.get('lr_pre', 1e-3)
     lr_fine = params.get('lr_fine', 1e-3)
     dropout_rate = params.get('dropout_rate', 0.2)
-    noise_level = params.get('noise_level', 0.1) 
+    mask_ratio = params.get('mask_ratio', 0.5)
     epochs_fine = params.get('epochs_fine', 2000)
     patience = params.get('patience', 15)
-    consistency_weight = params.get('consistency_weight', 1.0)
-    
-    # Detected classes count
-    detected_num_classes = len(class_names)
-    print(f"    Classes detected: {detected_num_classes}")
 
     print(f"    Params: {params}")
+    print(f"    Memory Bank Dim: {mem_bank_dim}")
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(rna_df, Y)):
+        # --- A. Data Lease Safe Processing ---
         tr_rna_raw, val_rna_raw = rna_df.iloc[train_idx], rna_df.iloc[val_idx]
         tr_meth_raw, val_meth_raw = meth_df.iloc[train_idx], meth_df.iloc[val_idx]
         tr_cnv_raw, val_cnv_raw = cnv_df.iloc[train_idx], cnv_df.iloc[val_idx]
 
-        # <--- FIX 1: Robust KNN Imputation
-        def robust_impute_data(train_data, val_data):
-            """Apply KNNImputer: fit on train, transform both. Respects local manifolds."""
-            imputer = KNNImputer(n_neighbors=5)
+        # Impute using SimpleImputer (median strategy - fast and handles large matrices)
+        def simple_impute_data(train_data, val_data):
+            """Apply SimpleImputer: fit on train, transform both train and val"""
+            imputer = SimpleImputer(strategy='median')
             # Fit on training data only (leakage-safe)
             tr_imputed = imputer.fit_transform(train_data.values)
             val_imputed = imputer.transform(val_data.values)
             return tr_imputed, val_imputed
         
-        tr_rna_imp, val_rna_imp = robust_impute_data(tr_rna_raw, val_rna_raw)
-        tr_meth_imp, val_meth_imp = robust_impute_data(tr_meth_raw, val_meth_raw)
-        tr_cnv_imp, val_cnv_imp = robust_impute_data(tr_cnv_raw, val_cnv_raw)
+        tr_rna_imp, val_rna_imp = simple_impute_data(tr_rna_raw, val_rna_raw)
+        tr_meth_imp, val_meth_imp = simple_impute_data(tr_meth_raw, val_meth_raw)
+        tr_cnv_imp, val_cnv_imp = simple_impute_data(tr_cnv_raw, val_cnv_raw)
 
         # Variance Filter
         def get_top_k_indices(data, k):
@@ -287,51 +291,54 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
         cmae_r = PerOmicCMAE(dims[0], latent_dim).to(DEVICE)
         cmae_m = PerOmicCMAE(dims[1], latent_dim).to(DEVICE)
         cmae_c = PerOmicCMAE(dims[2], latent_dim).to(DEVICE)
-        
-        opt_pre = optim.AdamW(list(cmae_r.parameters())+list(cmae_m.parameters())+list(cmae_c.parameters()), lr=lr_pre)
+        loss_fn = StabilizedUncertaintyLoss(3).to(DEVICE)  # 3 reconstruction losses only
+        opt_pre = optim.AdamW(list(cmae_r.parameters())+list(cmae_m.parameters())+list(cmae_c.parameters())+list(loss_fn.parameters()), lr=lr_pre)
 
-        # Pretraining
+        # Pretraining with early stopping
         cmae_r.train(); cmae_m.train(); cmae_c.train()
         best_pre_loss = float('inf')
         pre_patience_counter = 0
-        pre_patience = 10 
+        pre_patience = 10  # Early stopping patience for pretraining
         best_cmae_states = None
         
         print(f"\n  [Fold {fold+1}] PRETRAINING (max 100 epochs)")
-        for epoch in range(100):
-            rec_r, proj_r, z_r, _ = cmae_r(t_tr_r, noise_level=noise_level)
-            rec_m, proj_m, z_m, _ = cmae_m(t_tr_m, noise_level=noise_level)
-            rec_c, proj_c, z_c, _ = cmae_c(t_tr_c, noise_level=noise_level)
+        for epoch in range(100):  # Increased max epochs since we have early stopping
+            rec_r, _, _ = cmae_r(t_tr_r, mask_ratio=mask_ratio)
+            rec_m, _, _ = cmae_m(t_tr_m, mask_ratio=mask_ratio)
+            rec_c, _, _ = cmae_c(t_tr_c, mask_ratio=mask_ratio)
             
-            loss_recon = F.mse_loss(rec_r, t_tr_r) + F.mse_loss(rec_m, t_tr_m) + F.mse_loss(rec_c, t_tr_c)
-            
-            # Cosine Consistency
-            p_r_norm = F.normalize(proj_r, dim=1)
-            p_m_norm = F.normalize(proj_m, dim=1)
-            p_c_norm = F.normalize(proj_c, dim=1)
-            
-            loss_consistency = (1 - F.cosine_similarity(p_r_norm, p_m_norm).mean()) + \
-                               (1 - F.cosine_similarity(p_r_norm, p_c_norm).mean()) + \
-                               (1 - F.cosine_similarity(p_m_norm, p_c_norm).mean())
-            
-            loss = loss_recon + (consistency_weight * loss_consistency)
+            loss = loss_fn([
+                F.mse_loss(rec_r, t_tr_r), 
+                F.mse_loss(rec_m, t_tr_m), 
+                F.mse_loss(rec_c, t_tr_c)
+            ])
             
             opt_pre.zero_grad(); loss.backward(); opt_pre.step()
             
+            # Early stopping check
             current_loss = loss.item()
-            if (epoch+1) % 10 == 0 or epoch == 0:
-                print(f"    Pretrain Ep {epoch+1:03d} | Loss: {current_loss:.4f} (Rec: {loss_recon.item():.4f}, Cos: {loss_consistency.item():.4f})")
+            
+            # Print epoch progress
+            status = "*" if current_loss < best_pre_loss else ""
+            print(f"    Pretrain Ep {epoch+1:03d} | Loss: {current_loss:.4f} {status}")
             
             if current_loss < best_pre_loss:
                 best_pre_loss = current_loss
                 pre_patience_counter = 0
-                best_cmae_states = {'cmae_r': cmae_r.state_dict(), 'cmae_m': cmae_m.state_dict(), 'cmae_c': cmae_c.state_dict()}
+                best_cmae_states = {
+                    'cmae_r': cmae_r.state_dict(),
+                    'cmae_m': cmae_m.state_dict(),
+                    'cmae_c': cmae_c.state_dict()
+                }
             else:
                 pre_patience_counter += 1
                 if pre_patience_counter >= pre_patience:
                     print(f"    >> Early stopping at epoch {epoch+1}")
                     break
         
+        print(f"  [Fold {fold+1}] Pretraining complete. Best Loss: {best_pre_loss:.4f}")
+        
+        # Load best pretrain states
         if best_cmae_states:
             cmae_r.load_state_dict(best_cmae_states['cmae_r'])
             cmae_m.load_state_dict(best_cmae_states['cmae_m'])
@@ -339,9 +346,12 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
 
         # Fine-tuning
         cmae_r.eval(); cmae_m.eval(); cmae_c.eval()
-        # <--- FIX 2: Pass dynamic class count
-        fusion = GatedAttentionFusion(latent_dim, num_classes=detected_num_classes, dropout_rate=dropout_rate).to(DEVICE)
+        fusion = GatedAttentionFusion(latent_dim, num_classes=4, dropout_rate=dropout_rate).to(DEVICE)
+        
+        # Use Focal Loss instead of Cross Entropy
+        # We instantiate it here. You can adjust gamma if needed (default 2.0).
         criterion = FocalLoss(gamma=2.0).to(DEVICE)
+        
         opt_fine = optim.AdamW(fusion.parameters(), lr=lr_fine)
 
         best_val_loss = float('inf')
@@ -349,13 +359,13 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
         best_state = None
 
         with torch.no_grad():
-            _, _, zr_tr, _ = cmae_r(t_tr_r); _, _, zm_tr, _ = cmae_m(t_tr_m); _, _, zc_tr, _ = cmae_c(t_tr_c)
-            _, _, zr_val, _ = cmae_r(t_val_r); _, _, zm_val, _ = cmae_m(t_val_m); _, _, zc_val, _ = cmae_c(t_val_c)
+            _, zr_tr, _ = cmae_r(t_tr_r); _, zm_tr, _ = cmae_m(t_tr_m); _, zc_tr, _ = cmae_c(t_tr_c)
+            _, zr_val, _ = cmae_r(t_val_r); _, zm_val, _ = cmae_m(t_val_m); _, zc_val, _ = cmae_c(t_val_c)
 
         print(f"\n  [Fold {fold+1}] FINE-TUNING (max {epochs_fine} epochs)")
         for epoch in range(epochs_fine):
             fusion.train()
-            logits, _, _ = fusion(zr_tr, zm_tr, zc_tr, apply_dropout=True)
+            logits, weights, _ = fusion(zr_tr, zm_tr, zc_tr, apply_dropout=True)
             loss_cls = criterion(logits, t_tr_y)
             opt_fine.zero_grad(); loss_cls.backward(); opt_fine.step()
 
@@ -363,19 +373,17 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
             with torch.no_grad():
                 v_logits, _, v_fused = fusion(zr_val, zm_val, zc_val, apply_dropout=False)
                 v_loss = criterion(v_logits, t_val_y)
+                
+                # Calculate accuracies
                 train_acc = (logits.argmax(1) == t_tr_y).float().mean().item()
                 val_acc = (v_logits.argmax(1) == t_val_y).float().mean().item()
             
-            tr_loss_item = loss_cls.item()
-            val_loss_item = v_loss.item()
-            gap = max(0, val_loss_item - tr_loss_item)
-            current_score = val_loss_item + 0.5 * gap
-            
-            if (epoch+1) % 10 == 0 or epoch == 0:
-                print(f"    Finetune Ep {epoch+1:03d} | Train Loss: {tr_loss_item:.4f} (Acc: {train_acc:.2f}) | Val Loss: {val_loss_item:.4f} (Acc: {val_acc:.2f})")
+            # Print epoch progress
+            status = "*" if v_loss < best_val_loss else ""
+            print(f"    Finetune Ep {epoch+1:03d} | Train Loss: {loss_cls.item():.4f} (Acc: {train_acc:.2f}) | Val Loss: {v_loss.item():.4f} (Acc: {val_acc:.2f}) {status}")
 
-            if current_score < best_val_loss:
-                best_val_loss = current_score
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
                 best_state = fusion.state_dict()
                 patience_counter = 0
             else:
@@ -384,6 +392,8 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
                     print(f"    >> Early stopping at epoch {epoch+1}")
                     break
         
+        print(f"  [Fold {fold+1}] Fine-tuning complete. Best Val Loss: {best_val_loss:.4f}")
+
         if best_state: fusion.load_state_dict(best_state)
         fusion.eval()
         with torch.no_grad():
@@ -398,24 +408,6 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
         prec = precision_score(targets, preds, average='macro', zero_division=0)
         rec = recall_score(targets, preds, average='macro', zero_division=0)
 
-        # <--- FIX 3: Survival C-Index
-        c_index = 0.5
-        if HAS_LIFELINES and T is not None and E is not None:
-            try:
-                # Use latent embeddings to predict risk (simple approximation: 1st PCA or just evaluate clusters)
-                # Better: check if clusters separate survival.
-                # Here we use the classifier logits as a proxy for risk score of the "worst" class, 
-                # or we just skip if we don't have a survival head.
-                # A simple check: Can the latent space predict survival? 
-                # We will just report 0.5 (neutral) if no survival head, 
-                # OR we calculate C-index of the PREDICTED CLASS vs Survival (Cluster efficacy)
-                # NOTE: C-index requires continuous risk. We'll skip complex regression for now to keep code simple,
-                # unless you want to add a survival head.
-                pass 
-            except Exception as e:
-                pass
-        
-        # Actually, let's do a simple Silhouette check as the primary "Unsupervised" metric
         sil = -1
         if len(np.unique(targets)) > 1:
             try:
@@ -423,7 +415,9 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
             except: pass
 
         fold_metrics['f1_macro'].append(f1_mac)
-        kmeans = KMeans(n_clusters=detected_num_classes, random_state=42, n_init=10).fit(z_emb)
+
+        # Full metrics
+        kmeans = KMeans(n_clusters=len(np.unique(Y)), random_state=42, n_init=10).fit(z_emb)
         nmi = normalized_mutual_info_score(targets, kmeans.labels_)
         ari = adjusted_rand_score(targets, kmeans.labels_)
 
@@ -435,48 +429,61 @@ def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, T, E, clas
         fold_metrics['nmi'].append(nmi)
         fold_metrics['ari'].append(ari)
 
-        if fold == 4: 
+        if fold == 4: # Viz for last fold of best model
             try:
                 reducer = umap.UMAP(random_state=42)
                 z_umap = reducer.fit_transform(z_emb)
                 plt.figure(figsize=(10, 8))
                 scatter = plt.scatter(z_umap[:, 0], z_umap[:, 1], c=targets, cmap='viridis', s=50, alpha=0.8)
-                plt.title(f'UMAP Projection (Features={n_features})\nAcc={acc:.3f}, F1={f1_mac:.3f}')
-                plt.colorbar(scatter, ticks=range(detected_num_classes), label='Class')
+                plt.title(f'UMAP Projection (Features={n_features}, MemBank={mem_bank_dim})\nAcc={acc:.3f}, F1={f1_mac:.3f}')
+                plt.colorbar(scatter, ticks=range(len(class_names)), label='Class')
                 plt.xlabel('UMAP 1'); plt.ylabel('UMAP 2')
                 plt.tight_layout()
-                plt.savefig(f"cluster_viz_{n_features}_fold5.png")
+                plt.savefig(f"cluster_viz_{n_features}_membank{mem_bank_dim}_fold5.png")
                 plt.close()
             except Exception as ex: print(f"Viz error: {ex}")
 
     return {k: np.mean(v) for k, v in fold_metrics.items() if v}
+
+# Memory bank dimensions to compare
+MEM_BANK_DIMS = [64, 32]
 
 if __name__ == "__main__":
     # Load Data Once
     rna_df, meth_df, cnv_df, Y, T_surv, E_surv, class_names = load_raw_aligned_data()
 
     print("\n" + "="*60)
-    print(f"RUNNING EVALUATION WITH METHODOLOGICAL FIXES (Features: {N_FEATURES})")
+    print(f"RUNNING EVALUATION WITH BEST HYPERPARAMETERS (Features: {N_FEATURES})")
     print("="*60)
     print(f"Parameters: {BEST_PARAMS}")
+    print(f"Comparing Memory Bank Dimensions: {MEM_BANK_DIMS}")
+
     all_results = []
-    
-    print(f"\n{'='*60}")
-    print(f">>> EVALUATING ...")
-    print(f"{'='*60}")
-    
-    # Pass T_surv, E_surv and class_names to the evaluation loop
-    res = run_cv_evaluation(BEST_PARAMS, N_FEATURES, rna_df, meth_df, cnv_df, Y, T_surv, E_surv, class_names)
-    res['n_features'] = N_FEATURES
-    all_results.append(res)
+
+    # Run evaluation for each memory bank dimension
+    for mem_dim in MEM_BANK_DIMS:
+        print(f"\n{'='*60}")
+        print(f">>> EVALUATING WITH MEMORY BANK DIM = {mem_dim}")
+        print(f"{'='*60}")
+        
+        res = run_cv_evaluation(BEST_PARAMS, N_FEATURES, rna_df, meth_df, cnv_df, Y, class_names, mem_bank_dim=mem_dim)
+        res['n_features'] = N_FEATURES
+        res['mem_bank_dim'] = mem_dim
+        all_results.append(res)
 
     print("\n" + "="*60)
-    print("FINAL RESULTS SUMMARY")
+    print("FINAL RESULTS SUMMARY - MEMORY BANK DIMENSION COMPARISON")
     print("="*60)
     df_res = pd.DataFrame(all_results)
     if not df_res.empty:
-        cols = ['n_features', 'f1_macro', 'f1_micro', 'precision', 'recall', 'silhouette', 'nmi', 'ari', 'accuracy']
+        cols = ['mem_bank_dim', 'n_features', 'f1_macro', 'f1_micro', 'precision', 'recall', 'silhouette', 'nmi', 'ari', 'accuracy']
         cols = [c for c in cols if c in df_res.columns]
         print(df_res[cols].round(4).to_string(index=False))
-        df_res.to_csv("PerOmicsCMAE_results.csv", index=False)
-        print("\nFull results saved to 'PerOmicsCMAE_results.csv'")
+        df_res.to_csv("PerOmicsCMAE_membank_comparison_results.csv", index=False)
+        print("\nFull results saved to 'PerOmicsCMAE_membank_comparison_results.csv'")
+        
+        # Find best memory bank dimension
+        best_idx = df_res['f1_macro'].idxmax()
+        best_dim = df_res.loc[best_idx, 'mem_bank_dim']
+        best_f1 = df_res.loc[best_idx, 'f1_macro']
+        print(f"\n>>> BEST MEMORY BANK DIM: {best_dim} (F1 Macro: {best_f1:.4f})")

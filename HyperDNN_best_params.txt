@@ -1,5 +1,0 @@
-Features | F1_Macro | Params
-500 | 0.6606 | {'latent_dim': 16, 'hyper_hidden_dim': 64, 'embedding_dim': 32, 'rank': 16, 'n_encoder_layers': 2, 'lr_ae': 0.0005969077650654085, 'lr_clf': 0.004575600554058904, 'dropout': 0.46631498423344614, 'weight_decay': 0.0001275847717862087}
-1000 | 0.6579 | {'latent_dim': 48, 'hyper_hidden_dim': 32, 'embedding_dim': 16, 'rank': 4, 'n_encoder_layers': 1, 'lr_ae': 0.00022074041388116402, 'lr_clf': 0.001019211274975497, 'dropout': 0.44192053030929096, 'weight_decay': 0.0008455718681150147}
-2000 | 0.6349 | {'latent_dim': 48, 'hyper_hidden_dim': 32, 'embedding_dim': 32, 'rank': 16, 'n_encoder_layers': 2, 'lr_ae': 0.0006404012935168624, 'lr_clf': 0.007189652852805039, 'dropout': 0.405312461198395, 'weight_decay': 0.0019386711822918384}
-3000 | 0.6492 | {'latent_dim': 16, 'hyper_hidden_dim': 32, 'embedding_dim': 32, 'rank': 8, 'n_encoder_layers': 1, 'lr_ae': 0.0005756700206122857, 'lr_clf': 0.003721334026242035, 'dropout': 0.4533083628810092, 'weight_decay': 0.024986739291794815}

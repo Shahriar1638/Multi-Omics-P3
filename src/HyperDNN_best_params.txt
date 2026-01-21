@@ -1,7 +1,0 @@
-Features | F1_Macro | Params
-1500 | 0.6356 | {'latent_dim': 32, 'hyper_hidden_dim': 64, 'embedding_dim': 16, 'rank': 16, 'n_encoder_layers': 1, 'lr_ae': 0.0006641530926752813, 'lr_clf': 0.007797576565751152, 'dropout': 0.30628041912381915, 'weight_decay': 0.028119723123149958}
-2000 | 0.6248 | {'latent_dim': 16, 'hyper_hidden_dim': 64, 'embedding_dim': 16, 'rank': 8, 'n_encoder_layers': 1, 'lr_ae': 0.0003437381571408985, 'lr_clf': 0.0024551111855805885, 'dropout': 0.45667268194686994, 'weight_decay': 0.011571852858528115}
-2500 | 0.6199 | {'latent_dim': 32, 'hyper_hidden_dim': 32, 'embedding_dim': 16, 'rank': 8, 'n_encoder_layers': 1, 'lr_ae': 0.000557168219142195, 'lr_clf': 0.003984910018561678, 'dropout': 0.32250954597733306, 'weight_decay': 0.00060613273361489}
-3000 | 0.6316 | {'latent_dim': 48, 'hyper_hidden_dim': 64, 'embedding_dim': 16, 'rank': 16, 'n_encoder_layers': 1, 'lr_ae': 0.00016481682892295992, 'lr_clf': 0.001593784250548169, 'dropout': 0.4081436442172963, 'weight_decay': 0.016432983363942652}
-4000 | 0.6263 | {'latent_dim': 48, 'hyper_hidden_dim': 64, 'embedding_dim': 16, 'rank': 16, 'n_encoder_layers': 1, 'lr_ae': 0.0008429853427431629, 'lr_clf': 0.003975136840144553, 'dropout': 0.33995546641669044, 'weight_decay': 0.0012170486289895123}
-5000 | 0.6398 | {'latent_dim': 32, 'hyper_hidden_dim': 64, 'embedding_dim': 32, 'rank': 8, 'n_encoder_layers': 2, 'lr_ae': 0.00012247554439911393, 'lr_clf': 0.0013545533413410412, 'dropout': 0.4151231562098012, 'weight_decay': 0.00048004851415628277}

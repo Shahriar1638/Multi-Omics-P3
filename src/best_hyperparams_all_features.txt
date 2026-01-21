@@ -1,6 +1,0 @@
-Feature_Count | Best_Validation_F1_Macro | Best_Params
-2500 | 0.6565 | {'latent_dim': 128, 'lr_pre': 0.0002893561677094744, 'lr_fine': 0.0006003656376963125, 'dropout_rate': 0.42503590114103296, 'mask_ratio': 0.43522810503954523, 'epochs_fine': 500, 'patience': 15}
-5000 | 0.7015 | {'latent_dim': 128, 'lr_pre': 0.00021584102172935444, 'lr_fine': 0.0005707043882331389, 'dropout_rate': 0.1544009235029705, 'mask_ratio': 0.2774944218422873, 'epochs_fine': 500, 'patience': 15}
-7500 | 0.6858 | {'latent_dim': 256, 'lr_pre': 0.00015014231996436972, 'lr_fine': 0.0002029699286802775, 'dropout_rate': 0.14730563909082575, 'mask_ratio': 0.12805344738585886, 'epochs_fine': 500, 'patience': 15}
-10000 | 0.6963 | {'latent_dim': 256, 'lr_pre': 0.00025967397799518585, 'lr_fine': 0.00046108507289050057, 'dropout_rate': 0.13276906217271206, 'mask_ratio': 0.3279234272082725, 'epochs_fine': 500, 'patience': 15}
-15000 | 0.6973 | {'latent_dim': 128, 'lr_pre': 0.00042598383553247107, 'lr_fine': 0.0006651507262003653, 'dropout_rate': 0.3718278457325569, 'mask_ratio': 0.10708908436497266, 'epochs_fine': 500, 'patience': 15}

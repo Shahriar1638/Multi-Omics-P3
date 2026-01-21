@@ -1,1 +1,5 @@
 .env\Scripts\activate.bat
+
+1. apply boruta in 1200 features
+2. try mRMR and elastic net
+3.
