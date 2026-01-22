@@ -1,0 +1,333 @@
+# -*- coding: utf-8 -*-
+"""
+PeromicsCMAE Evaluation Suite
+=============================
+1. Ablation Study: Single vs. Multi-Omics
+2. Modality Significance: Permutation Test + Gate Analysis
+3. Biological Interpretation: Gradient-based Saliency for Top Genes
+"""
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import f1_score, accuracy_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+import copy
+import sys
+
+# --- IMPORT YOUR FIXED MODEL ---
+# Ensure PeromicsCMAE_Fixed.py is in the directory
+from PeromicsCMAE_Fixed import (
+    load_raw_aligned_data, PerOmicCMAE, GatedFeatureFusion, 
+    NTXentLoss, FocalLoss, DEVICE
+)
+
+# Configuration
+N_FEATURES = 2000
+BEST_PARAMS = {
+    'latent_dim': 64,
+    'hidden_dim': 128,  # From your Optuna result
+    'fusion_hidden_dim': 64, 
+    'dropout_rate': 0.3,
+    'focal_gamma': 4.0,
+    'lr_fine': 1e-4
+}
+
+def get_data_splits(rna, meth, cnv, Y):
+    """Generate fixed 5-fold splits for consistent evaluation"""
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    splits = []
+    for train_idx, val_idx in kf.split(rna, Y):
+        splits.append((train_idx, val_idx))
+    return splits
+
+def train_ablation_variant(variant_name, splits, rna, meth, cnv, Y, class_weights):
+    """
+    Trains and evaluates specific ablation variants.
+    variant_name: 'multiomics', 'rna_only', 'meth_only', 'cnv_only'
+    """
+    f1_scores = []
+    print(f"\n{'='*40}")
+    print(f"EVALUATING VARIANT: {variant_name.upper()}")
+    print(f"{'='*40}")
+    
+    for fold, (train_idx, val_idx) in enumerate(splits):
+        # --- 1. Data Prep (Standard Scaling) ---
+        # Note: We repeat this inside the loop to prevent leakage
+        tr_r, val_r = rna.iloc[train_idx].values, rna.iloc[val_idx].values
+        tr_m, val_m = meth.iloc[train_idx].values, meth.iloc[val_idx].values
+        tr_c, val_c = cnv.iloc[train_idx].values, cnv.iloc[val_idx].values
+        
+        imp = SimpleImputer(strategy='median')
+        sc = StandardScaler()
+        
+        # Helper to process one matrix with feature selection
+        def proc(tr, val):
+            tr_imp = imp.fit_transform(tr)
+            val_imp = imp.transform(val)
+            # Select top variance features
+            vars = np.var(tr_imp, axis=0)
+            idx = np.argpartition(vars, -N_FEATURES)[-N_FEATURES:]
+            return sc.fit_transform(tr_imp[:, idx]), sc.transform(val_imp[:, idx]), idx
+
+        tr_r, val_r, idx_r = proc(tr_r, val_r)
+        tr_m, val_m, idx_m = proc(tr_m, val_m)
+        tr_c, val_c, idx_c = proc(tr_c, val_c)
+
+        # To Tensors
+        t_tr_r = torch.FloatTensor(tr_r).to(DEVICE)
+        t_tr_m = torch.FloatTensor(tr_m).to(DEVICE)
+        t_tr_c = torch.FloatTensor(tr_c).to(DEVICE)
+        t_tr_y = torch.LongTensor(Y[train_idx]).to(DEVICE)
+        
+        t_val_r = torch.FloatTensor(val_r).to(DEVICE)
+        t_val_m = torch.FloatTensor(val_m).to(DEVICE)
+        t_val_c = torch.FloatTensor(val_c).to(DEVICE)
+
+        # --- 2. Model Init ---
+        cmae_r = PerOmicCMAE(tr_r.shape[1], 64).to(DEVICE)
+        cmae_m = PerOmicCMAE(tr_m.shape[1], 64).to(DEVICE)
+        cmae_c = PerOmicCMAE(tr_c.shape[1], 64).to(DEVICE)
+        fusion = GatedFeatureFusion(64, num_classes=4).to(DEVICE)
+        
+        opt = torch.optim.AdamW(list(fusion.parameters()) + list(cmae_r.parameters()) + 
+                                list(cmae_m.parameters()) + list(cmae_c.parameters()), lr=1e-4)
+        crit = torch.nn.CrossEntropyLoss() # Simplified for ablation speed
+
+        # --- 3. Training with Zero-Masking for Ablation ---
+        for epoch in range(150): 
+            cmae_r.train(); cmae_m.train(); cmae_c.train(); fusion.train()
+            
+            # Ablation Logic: Feed Zeros to encoders we want to ignore
+            # This keeps architecture identical (fair comparison)
+            if variant_name == 'rna_only':
+                z_r = cmae_r.encoder(t_tr_r)
+                z_m = torch.zeros_like(z_r) # Masked
+                z_c = torch.zeros_like(z_r) # Masked
+            elif variant_name == 'meth_only':
+                z_m = cmae_m.encoder(t_tr_m)
+                z_r = torch.zeros_like(z_m)
+                z_c = torch.zeros_like(z_m)
+            elif variant_name == 'cnv_only':
+                z_c = cmae_c.encoder(t_tr_c)
+                z_r = torch.zeros_like(z_c)
+                z_m = torch.zeros_like(z_c)
+            else: # Multiomics
+                z_r = cmae_r.encoder(t_tr_r)
+                z_m = cmae_m.encoder(t_tr_m)
+                z_c = cmae_c.encoder(t_tr_c)
+
+            logits, _, _ = fusion(z_r, z_m, z_c)
+            loss = crit(logits, t_tr_y)
+            
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        # --- 4. Evaluation ---
+        cmae_r.eval(); cmae_m.eval(); cmae_c.eval(); fusion.eval()
+        with torch.no_grad():
+            if variant_name == 'rna_only':
+                z_r = cmae_r.encoder(t_val_r)
+                z_m = torch.zeros_like(z_r)
+                z_c = torch.zeros_like(z_r)
+            elif variant_name == 'meth_only':
+                z_m = cmae_m.encoder(t_val_m)
+                z_r = torch.zeros_like(z_m)
+                z_c = torch.zeros_like(z_m)
+            elif variant_name == 'cnv_only':
+                z_c = cmae_c.encoder(t_val_c)
+                z_r = torch.zeros_like(z_c)
+                z_m = torch.zeros_like(z_c)
+            else:
+                z_r = cmae_r.encoder(t_val_r)
+                z_m = cmae_m.encoder(t_val_m)
+                z_c = cmae_c.encoder(t_val_c)
+                
+            logits, _, _ = fusion(z_r, z_m, z_c)
+            preds = logits.argmax(dim=1).cpu().numpy()
+            f1 = f1_score(Y[val_idx], preds, average='macro')
+            f1_scores.append(f1)
+            
+            # Save the full multiomics model from Fold 0 for interpretation steps later
+            if fold == 0 and variant_name == 'multiomics':
+                torch.save({
+                    'r': cmae_r.state_dict(), 'm': cmae_m.state_dict(), 'c': cmae_c.state_dict(),
+                    'f': fusion.state_dict(), 'idx_r': idx_r, 'idx_m': idx_m, 'idx_c': idx_c
+                }, 'best_ablation_model.pt')
+                
+        print(f"  Fold {fold+1} F1: {f1:.4f}")
+
+    return np.mean(f1_scores), np.std(f1_scores)
+
+def analyze_modality_significance(rna, meth, cnv, Y, splits):
+    """
+    1. Permutation Importance: Shuffle one omic, measure acc drop.
+    2. Gate Analysis: Extract learned weights from fusion layer.
+    """
+    print("\n{'='*40}")
+    print("MODALITY SIGNIFICANCE ANALYSIS")
+    print(f"{'='*40}")
+    
+    # Load model from Fold 0
+    checkpoint = torch.load('best_ablation_model.pt')
+    
+    # Reconstruct
+    cmae_r = PerOmicCMAE(N_FEATURES, 64).to(DEVICE); cmae_r.load_state_dict(checkpoint['r'])
+    cmae_m = PerOmicCMAE(N_FEATURES, 64).to(DEVICE); cmae_m.load_state_dict(checkpoint['m'])
+    cmae_c = PerOmicCMAE(N_FEATURES, 64).to(DEVICE); cmae_c.load_state_dict(checkpoint['c'])
+    fusion = GatedFeatureFusion(64, num_classes=4).to(DEVICE); fusion.load_state_dict(checkpoint['f'])
+    cmae_r.eval(); cmae_m.eval(); cmae_c.eval(); fusion.eval()
+    
+    # Get Val Data (Fold 0)
+    train_idx, val_idx = splits[0]
+    
+    def fast_prep(df, idx):
+        raw = df.iloc[val_idx].values
+        # Simple prep for eval
+        imp = SimpleImputer(strategy='median').fit(df.iloc[train_idx].values) 
+        sc = StandardScaler().fit(imp.transform(df.iloc[train_idx].values)[:, idx])
+        return torch.FloatTensor(sc.transform(imp.transform(raw)[:, idx])).to(DEVICE)
+
+    t_val_r = fast_prep(rna, checkpoint['idx_r'])
+    t_val_m = fast_prep(meth, checkpoint['idx_m'])
+    t_val_c = fast_prep(cnv, checkpoint['idx_c'])
+    t_y = torch.LongTensor(Y[val_idx]).to(DEVICE)
+
+    # --- 1. Baseline Accuracy ---
+    with torch.no_grad():
+        z_r = cmae_r.encoder(t_val_r)
+        z_m = cmae_m.encoder(t_val_m)
+        z_c = cmae_c.encoder(t_val_c)
+        base_logits, gate_vals, _ = fusion(z_r, z_m, z_c)
+        base_acc = (base_logits.argmax(1) == t_y).float().mean().item()
+
+    print(f"Baseline Accuracy (Fold 0): {base_acc:.4f}")
+    
+    # --- 2. Gate Weight Analysis ---
+    # gate_vals is [Batch, 192]. 0-63=RNA, 64-127=Meth, 128-191=CNV
+    avg_gates = gate_vals.mean(dim=0).cpu().numpy()
+    
+    g_r = avg_gates[0:64].mean()
+    g_m = avg_gates[64:128].mean()
+    g_c = avg_gates[128:].mean()
+    
+    print(f"\n[A] Learned Gate Weights (0.0 - 1.0):")
+    print(f"    RNA:  {g_r:.4f}")
+    print(f"    Meth: {g_m:.4f}")
+    print(f"    CNV:  {g_c:.4f}")
+    print("    (Higher = Model trusts this modality more)")
+
+    # --- 3. Permutation Importance ---
+    print(f"\n[B] Permutation Importance (Drop in Acc):")
+    importances = {}
+    for mod_name, tensor in [('RNA', t_val_r), ('Meth', t_val_m), ('CNV', t_val_c)]:
+        # Shuffle batch dimension only for this tensor
+        shuffled = tensor[torch.randperm(tensor.size(0))]
+        
+        with torch.no_grad():
+            if mod_name == 'RNA':
+                logits, _, _ = fusion(cmae_r.encoder(shuffled), cmae_m.encoder(t_val_m), cmae_c.encoder(t_val_c))
+            elif mod_name == 'Meth':
+                logits, _, _ = fusion(cmae_r.encoder(t_val_r), cmae_m.encoder(shuffled), cmae_c.encoder(t_val_c))
+            else:
+                logits, _, _ = fusion(cmae_r.encoder(t_val_r), cmae_m.encoder(t_val_m), cmae_c.encoder(shuffled))
+            
+            acc = (logits.argmax(1) == t_y).float().mean().item()
+            drop = base_acc - acc
+            importances[mod_name] = drop
+            print(f"    Shuffle {mod_name:<5} -> Acc: {acc:.4f} (Drop: {drop:.4f})")
+            
+    return importances
+
+def interpret_genes(rna_df, Y, class_names):
+    """
+    Saliency Mapping: Gradients of Latent Norm w.r.t Input Features
+    Finds which genes activate the latent space most strongly.
+    """
+    print("\n{'='*40}")
+    print("TOP GENE IDENTIFICATION (Saliency)")
+    print(f"{'='*40}")
+    
+    checkpoint = torch.load('best_ablation_model.pt')
+    model = PerOmicCMAE(N_FEATURES, 64).to(DEVICE)
+    model.load_state_dict(checkpoint['r'])
+    model.eval()
+    
+    # Identify which genes were selected
+    all_genes = rna_df.columns
+    selected_genes = all_genes[checkpoint['idx_r']]
+    
+    top_genes_per_class = {}
+    
+    for cls_idx, cls_name in enumerate(class_names):
+        # Select 5 representative samples from this class
+        sample_indices = np.where(Y == cls_idx)[0]
+        if len(sample_indices) > 5: sample_indices = sample_indices[:5]
+        
+        # Prepare Input
+        raw = rna_df.iloc[sample_indices].values
+        imp = SimpleImputer(strategy='median').fit(rna_df.values)
+        sc = StandardScaler().fit(imp.transform(rna_df.values)[:, checkpoint['idx_r']])
+        
+        # Enable gradients on input
+        input_tensor = torch.FloatTensor(sc.transform(imp.transform(raw)[:, checkpoint['idx_r']])).to(DEVICE)
+        input_tensor.requires_grad = True
+        
+        # Forward -> Latent
+        z = model.encoder(input_tensor)
+        
+        # Objective: Maximize activation of latent space (Proxy for feature importance)
+        # We sum the latent vector to get a scalar for backward()
+        score = z.sum()
+        score.backward()
+        
+        # Saliency = |Gradient * Input|
+        saliency = (input_tensor.grad * input_tensor).abs()
+        mean_saliency = saliency.mean(dim=0).cpu().numpy()
+        
+        # Top 10 Genes
+        top_idx = np.argsort(mean_saliency)[-10:][::-1]
+        top_genes = selected_genes[top_idx]
+        top_genes_per_class[cls_name] = list(top_genes)
+        
+        print(f"  Class [{cls_name}]:")
+        print(f"    {', '.join(list(top_genes))}")
+        
+    return top_genes_per_class
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    # 1. Load Data
+    result = load_raw_aligned_data()
+    if result is None: sys.exit()
+    rna, meth, cnv, Y, class_names, class_weights = result[0], result[1], result[2], result[3], result[6], result[7]
+    
+    splits = get_data_splits(rna, meth, cnv, Y)
+    
+    # 2. Run Ablation
+    res_multi = train_ablation_variant('multiomics', splits, rna, meth, cnv, Y, class_weights)
+    res_rna = train_ablation_variant('rna_only', splits, rna, meth, cnv, Y, class_weights)
+    res_meth = train_ablation_variant('meth_only', splits, rna, meth, cnv, Y, class_weights)
+    res_cnv = train_ablation_variant('cnv_only', splits, rna, meth, cnv, Y, class_weights)
+    
+    print("\n" + "="*40)
+    print("FINAL ABLATION SUMMARY (F1-MACRO)")
+    print("="*40)
+    print(f"Multi-Omics: {res_multi[0]:.4f} +/- {res_multi[1]:.4f}")
+    print(f"RNA Only:    {res_rna[0]:.4f} +/- {res_rna[1]:.4f}")
+    print(f"Meth Only:   {res_meth[0]:.4f} +/- {res_meth[1]:.4f}")
+    print(f"CNV Only:    {res_cnv[0]:.4f} +/- {res_cnv[1]:.4f}")
+    
+    # 3. Analyze Importance
+    analyze_modality_significance(rna, meth, cnv, Y, splits)
+    
+    # 4. Interpret Genes
+    interpret_genes(rna, Y, class_names)

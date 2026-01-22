@@ -1,0 +1,455 @@
+# -*- coding: utf-8 -*-
+"""
+PeromicsCMAE_Fixed_SOTA
+=======================
+Upgrades:
+1. Feature-Wise Gating (replacing scalar attention)
+2. Anchor Loss during fine-tuning (prevent catastrophic forgetting)
+3. Optimized Hyperparameter Ranges based on Trial 43 forensics
+"""
+
+import sys
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import StratifiedKFold
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score, precision_score, recall_score, silhouette_score, accuracy_score, normalized_mutual_info_score, adjusted_rand_score
+from sklearn.cluster import KMeans
+import optuna
+from optuna.trial import TrialState
+import warnings
+warnings.filterwarnings('ignore')
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f">>> Running on: {DEVICE}")
+
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Feature count
+N_FEATURES = 2000
+
+SUBTYPES_OF_INTEREST = [
+    'Leiomyosarcoma, NOS',
+    'Dedifferentiated liposarcoma',
+    'Undifferentiated sarcoma',
+    'Fibromyxosarcoma'
+]
+
+# ==========================================
+# DATA LOADING (Unchanged)
+# ==========================================
+def load_raw_aligned_data():
+    print(f"\n>>> LOADING RAW ALIGNED DATA")
+    pheno_path = "Data/phenotype_clean.csv"
+    if not os.path.exists(pheno_path):
+        raise FileNotFoundError(f"{pheno_path} not found.")
+
+    pheno = pd.read_csv(pheno_path, index_col=0)
+    col_name = 'primary_diagnosis.diagnoses'
+    
+    mask = pheno[col_name].isin(SUBTYPES_OF_INTEREST)
+    pheno = pheno[mask]
+
+    def load_omic(path):
+        if not os.path.exists(path): return None
+        df = pd.read_csv(path, index_col=0).T
+        return df
+
+    rna = load_omic("Data/expression_log.csv")
+    meth = load_omic("Data/methylation_mvalues.csv")
+    cnv = load_omic("Data/cnv_log.csv")
+
+    if rna is None or meth is None or cnv is None:
+        raise ValueError("One or more omics files missing.")
+
+    common_samples = pheno.index.intersection(rna.index).intersection(meth.index).intersection(cnv.index)
+    print(f"  Common Samples: {len(common_samples)}")
+
+    pheno = pheno.loc[common_samples]
+    rna = rna.loc[common_samples]
+    meth = meth.loc[common_samples]
+    cnv = cnv.loc[common_samples]
+
+    le = LabelEncoder()
+    Y = le.fit_transform(pheno[col_name])
+    
+    class_counts = np.bincount(Y)
+    class_weights = len(Y) / (len(class_counts) * class_counts)
+    class_weights = class_weights / class_weights.sum()
+
+    return rna, meth, cnv, Y, le.classes_, class_weights
+
+# ==========================================
+# MODEL COMPONENTS
+# ==========================================
+
+class NTXentLoss(nn.Module):
+    def __init__(self, temperature=0.5):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, z_i, z_j):
+        batch_size = z_i.shape[0]
+        z_i = F.normalize(z_i, dim=1)
+        z_j = F.normalize(z_j, dim=1)
+        z = torch.cat([z_i, z_j], dim=0)
+        sim = torch.mm(z, z.t()) / self.temperature
+        mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
+        sim.masked_fill_(mask, -9e15)
+        target = torch.arange(batch_size, device=z.device)
+        target = torch.cat([target + batch_size, target], dim=0)
+        return F.cross_entropy(sim, target)
+
+class PerOmicCMAE(nn.Module):
+    def __init__(self, input_dim, latent_dim=64, hidden_dim=256, dropout_encoder=0.0):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim), 
+            nn.GELU(),
+            nn.Dropout(dropout_encoder),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim), 
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        self.projector = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim), 
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+
+    def forward(self, x, noise_level=0.0, noise_type='gaussian', encode_only=False):
+        if self.training and noise_level > 0:
+            if noise_type == 'gaussian':
+                noise = torch.randn_like(x) * noise_level
+                x_corrupted = x + noise
+            elif noise_type == 'uniform':
+                noise = (torch.rand_like(x) - 0.5) * 2 * noise_level
+                x_corrupted = x + noise
+            elif noise_type == 'dropout':
+                mask = torch.bernoulli(torch.ones_like(x) * (1 - noise_level))
+                x_corrupted = x * mask
+            else:
+                x_corrupted = x
+        else:
+            x_corrupted = x
+
+        z = self.encoder(x_corrupted)
+        
+        if encode_only:
+            return None, None, z, x_corrupted
+        
+        rec = self.decoder(z)
+        proj = self.projector(z)
+        return rec, proj, z, x_corrupted
+
+# --- UPGRADE 1: Feature-Wise Gating ---
+class GatedFeatureFusion(nn.Module):
+    def __init__(self, latent_dim=64, num_classes=4, dropout_rate=0.3, hidden_dim=64):
+        super().__init__()
+        # SOTA CHANGE: Gates output (latent_dim), not (1)
+        self.gate_rna = nn.Linear(latent_dim, latent_dim)
+        self.gate_meth = nn.Linear(latent_dim, latent_dim)
+        self.gate_clin = nn.Linear(latent_dim, latent_dim)
+        
+        # LayerNorm is critical for stability with high gamma
+        self.ln_rna = nn.LayerNorm(latent_dim)
+        self.ln_meth = nn.LayerNorm(latent_dim)
+        self.ln_clin = nn.LayerNorm(latent_dim)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        self.drop_rate = dropout_rate
+
+    def forward(self, z_rna, z_meth, z_clin, apply_dropout=False):
+        # Feature-wise gating (Sigmoid)
+        g_rna = torch.sigmoid(self.gate_rna(z_rna))
+        g_meth = torch.sigmoid(self.gate_meth(z_meth))
+        g_clin = torch.sigmoid(self.gate_clin(z_clin))
+
+        # Apply gates to normalized embeddings
+        h_rna = g_rna * self.ln_rna(z_rna)
+        h_meth = g_meth * self.ln_meth(z_meth)
+        h_clin = g_clin * self.ln_clin(z_clin)
+
+        # Dropout on the embeddings themselves (modality dropout)
+        if apply_dropout and self.training:
+            if torch.rand(1).item() < self.drop_rate: h_rna = torch.zeros_like(h_rna)
+            if torch.rand(1).item() < self.drop_rate: h_meth = torch.zeros_like(h_meth)
+            if torch.rand(1).item() < self.drop_rate: h_clin = torch.zeros_like(h_clin)
+
+        z_fused = torch.cat([h_rna, h_meth, h_clin], dim=1)
+        
+        # Return logits, gates (concatenated), and fused embedding
+        return self.classifier(z_fused), torch.cat([g_rna, g_meth, g_clin], dim=1), z_fused
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.alpha is not None:
+            if isinstance(self.alpha, (float, int)):
+                alpha_t = self.alpha
+            else:
+                if self.alpha.device != inputs.device:
+                    self.alpha = self.alpha.to(inputs.device)
+                alpha_t = self.alpha.gather(0, targets)
+            focal_loss = alpha_t * focal_loss
+
+        if self.reduction == 'mean': return focal_loss.mean()
+        elif self.reduction == 'sum': return focal_loss.sum()
+        else: return focal_loss
+
+# ==========================================
+# CV LOOP
+# ==========================================
+
+def run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, class_names, 
+                      class_weights, verbose=True, trial=None):
+    
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_metrics = {'accuracy': [], 'f1_macro': [], 'silhouette': [], 'ari': []}
+
+    # Locked/Optimized Params
+    latent_dim = params.get('latent_dim', 64) # LOCKED to 64
+    hidden_dim = params.get('hidden_dim', 64)
+    fusion_hidden_dim = params.get('fusion_hidden_dim', 64)
+    
+    lr_pre = params.get('lr_pre', 1e-3)
+    lr_fine = params.get('lr_fine', 1e-3)
+    dropout_rate = params.get('dropout_rate', 0.2)
+    dropout_encoder = params.get('dropout_encoder', 0.0)
+    noise_level = params.get('noise_level', 0.1)
+    noise_type = params.get('noise_type', 'gaussian')
+    focal_gamma = params.get('focal_gamma', 4.0) # High gamma default
+    
+    anchor_weight = params.get('anchor_weight', 0.1) # New param
+    
+    ntxent_weight = params.get('ntxent_weight', 5.0)
+    max_rel_gap_pre = params.get('max_rel_gap_pre', 0.5)
+    
+    MAX_EPOCHS_PRE = 700
+    MAX_EPOCHS_FINE = 1200
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(rna_df, Y)):
+        # --- Data Prep (Leakage Free) ---
+        def prep_fold_data(df, tr_idx, v_idx):
+            tr, val = df.iloc[tr_idx], df.iloc[v_idx]
+            imp = SimpleImputer(strategy='median')
+            tr_imp = imp.fit_transform(tr.values)
+            val_imp = imp.transform(val.values)
+            
+            # Select features by variance
+            vars = np.var(tr_imp, axis=0)
+            idx = np.argpartition(vars, -n_features)[-n_features:]
+            
+            sc = StandardScaler()
+            tr_sc = sc.fit_transform(tr_imp[:, idx])
+            val_sc = sc.transform(val_imp[:, idx])
+            return tr_sc, val_sc, tr_sc.shape[1]
+
+        tr_r, val_r, d_r = prep_fold_data(rna_df, train_idx, val_idx)
+        tr_m, val_m, d_m = prep_fold_data(meth_df, train_idx, val_idx)
+        tr_c, val_c, d_c = prep_fold_data(cnv_df, train_idx, val_idx)
+
+        t_tr_r = torch.FloatTensor(tr_r).to(DEVICE)
+        t_tr_m = torch.FloatTensor(tr_m).to(DEVICE)
+        t_tr_c = torch.FloatTensor(tr_c).to(DEVICE)
+        t_tr_y = torch.LongTensor(Y[train_idx]).to(DEVICE)
+
+        t_val_r = torch.FloatTensor(val_r).to(DEVICE)
+        t_val_m = torch.FloatTensor(val_m).to(DEVICE)
+        t_val_c = torch.FloatTensor(val_c).to(DEVICE)
+        t_val_y = torch.LongTensor(Y[val_idx]).to(DEVICE)
+
+        # --- Init Models ---
+        cmae_r = PerOmicCMAE(d_r, latent_dim, hidden_dim, dropout_encoder).to(DEVICE)
+        cmae_m = PerOmicCMAE(d_m, latent_dim, hidden_dim, dropout_encoder).to(DEVICE)
+        cmae_c = PerOmicCMAE(d_c, latent_dim, hidden_dim, dropout_encoder).to(DEVICE)
+
+        # --- Pretraining ---
+        opt_pre = optim.AdamW(list(cmae_r.parameters()) + list(cmae_m.parameters()) + list(cmae_c.parameters()), 
+                             lr=lr_pre, weight_decay=1e-4)
+        criterion_ntxent = NTXentLoss(temperature=params.get('ntxent_temperature', 0.3)).to(DEVICE)
+        
+        best_pre_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(MAX_EPOCHS_PRE):
+            cmae_r.train(); cmae_m.train(); cmae_c.train()
+            
+            r_rec, r_proj, _, _ = cmae_r(t_tr_r, noise_level=noise_level, noise_type=noise_type)
+            m_rec, m_proj, _, _ = cmae_m(t_tr_m, noise_level=noise_level, noise_type=noise_type)
+            c_rec, c_proj, _, _ = cmae_c(t_tr_c, noise_level=noise_level, noise_type=noise_type)
+
+            loss_recon = F.mse_loss(r_rec, t_tr_r) + F.mse_loss(m_rec, t_tr_m) + F.mse_loss(c_rec, t_tr_c)
+            loss_nt = (criterion_ntxent(r_proj, m_proj) + criterion_ntxent(r_proj, c_proj) + criterion_ntxent(m_proj, c_proj)) / 3.0
+            
+            loss = loss_recon + ntxent_weight * loss_nt
+            
+            opt_pre.zero_grad()
+            loss.backward()
+            opt_pre.step()
+            
+            if epoch % 10 == 0:
+                with torch.no_grad():
+                    # Simple validation check
+                    rr, rp, _, _ = cmae_r(t_val_r)
+                    mr, mp, _, _ = cmae_m(t_val_m)
+                    cr, cp, _, _ = cmae_c(t_val_c)
+                    val_loss = F.mse_loss(rr, t_val_r) + F.mse_loss(mr, t_val_m) + F.mse_loss(cr, t_val_c)
+                    
+                    if val_loss < best_pre_loss:
+                        best_pre_loss = val_loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        
+            if patience_counter > 20: break # Simple early stopping
+
+        # --- Joint Training (SOTA UPDATES) ---
+        # 1. Use Feature-Wise Gating
+        fusion = GatedFeatureFusion(latent_dim, num_classes=len(np.unique(Y)), 
+                                   dropout_rate=dropout_rate, hidden_dim=fusion_hidden_dim).to(DEVICE)
+        
+        alpha = torch.FloatTensor(class_weights * params.get('focal_alpha_scale', 1.0)).to(DEVICE)
+        criterion_cls = FocalLoss(gamma=focal_gamma, alpha=alpha)
+        
+        opt_fine = optim.AdamW(list(cmae_r.encoder.parameters()) + list(cmae_m.encoder.parameters()) + 
+                              list(cmae_c.encoder.parameters()) + list(fusion.parameters()),
+                              lr=lr_fine, weight_decay=1e-4)
+        
+        best_f1 = 0.0
+        fine_patience_counter = 0
+        FINE_PATIENCE = 30  # Stop if no improvement for 30 checks (150 epochs)
+        
+        for epoch in range(MAX_EPOCHS_FINE):
+            cmae_r.train(); cmae_m.train(); cmae_c.train(); fusion.train()
+            
+            # UPGRADE 2: Anchor Loss
+            # We run with encode_only=False to get reconstruction for regularization
+            rec_r, _, zr, _ = cmae_r(t_tr_r, noise_level=0.0, encode_only=False)
+            rec_m, _, zm, _ = cmae_m(t_tr_m, noise_level=0.0, encode_only=False)
+            rec_c, _, zc, _ = cmae_c(t_tr_c, noise_level=0.0, encode_only=False)
+            
+            logits, _, _ = fusion(zr, zm, zc, apply_dropout=True)
+            
+            # Primary Loss: Classification
+            loss_cls = criterion_cls(logits, t_tr_y)
+            
+            # Auxiliary Loss: Anchor (Reconstruction) to prevent forgetting manifold
+            loss_anchor = F.mse_loss(rec_r, t_tr_r) + F.mse_loss(rec_m, t_tr_m) + F.mse_loss(rec_c, t_tr_c)
+            
+            total_loss = loss_cls + (anchor_weight * loss_anchor)
+
+            opt_fine.zero_grad()
+            total_loss.backward()
+            opt_fine.step()
+            
+            # Validation
+            if epoch % 5 == 0:
+                cmae_r.eval(); cmae_m.eval(); cmae_c.eval(); fusion.eval()
+                with torch.no_grad():
+                    _, _, zr_v, _ = cmae_r(t_val_r, encode_only=True)
+                    _, _, zm_v, _ = cmae_m(t_val_m, encode_only=True)
+                    _, _, zc_v, _ = cmae_c(t_val_c, encode_only=True)
+                    logits_v, _, _ = fusion(zr_v, zm_v, zc_v)
+                    preds = logits_v.argmax(dim=1).cpu().numpy()
+                    targets = t_val_y.cpu().numpy()
+                    
+                    f1 = f1_score(targets, preds, average='macro')
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        fine_patience_counter = 0
+                        # Save state logic here if needed
+                    else:
+                        fine_patience_counter += 1
+            
+            # Early stopping for fine-tuning
+            if fine_patience_counter >= FINE_PATIENCE:
+                if verbose:
+                    print(f"      Early stop at epoch {epoch}, best F1={best_f1:.4f}")
+                break
+                    
+        # Final Metrics for Fold
+        fold_metrics['f1_macro'].append(best_f1)
+        
+        if verbose:
+            print(f"    Fold {fold+1}: Best F1-Macro={best_f1:.4f}")
+
+    return {k: np.mean(v) for k, v in fold_metrics.items() if v}
+
+# ==========================================
+# OPTUNA OBJECTIVE
+# ==========================================
+
+def objective(trial, rna_df, meth_df, cnv_df, Y, class_names, class_weights, n_features):
+    
+    # Updated hyperparam ranges based on Trial 43 Forensics
+    params = {
+        'latent_dim': trial.suggest_categorical('latent_dim', [32, 48, 64]),
+        'hidden_dim': trial.suggest_categorical('hidden_dim', [128, 256]),
+        'fusion_hidden_dim': trial.suggest_categorical('fusion_hidden_dim', [16, 32, 48, 64]),
+        
+        'lr_pre': trial.suggest_float('lr_pre', 1e-4, 1e-3, log=True),
+        'lr_fine': trial.suggest_float('lr_fine', 1e-5, 1e-3, log=True),
+        
+        'dropout_rate': trial.suggest_float('dropout_rate', 0.05, 0.4), # Increased min dropout
+        'dropout_encoder': trial.suggest_float('dropout_encoder', 0.1, 0.3),
+        
+        'noise_level': trial.suggest_float('noise_level', 0.1, 0.3),
+        'noise_type': trial.suggest_categorical('noise_type', ['gaussian', 'uniform']),
+        
+        # High Gamma Range
+        'focal_gamma': trial.suggest_float('focal_gamma', 3.0, 5.0),
+        'focal_alpha_scale': trial.suggest_float('focal_alpha_scale', 0.5, 3.0),
+        
+        # High Contrastive Weight
+        'ntxent_weight': trial.suggest_float('ntxent_weight', 2.0, 7.0),
+        'ntxent_temperature': trial.suggest_float('ntxent_temperature', 0.2, 0.5),
+        
+        # New Anchor Weight
+        'anchor_weight': trial.suggest_float('anchor_weight', 0.05, 0.5)
+    }
+    
+    try:
+        metrics = run_cv_evaluation(params, n_features, rna_df, meth_df, cnv_df, Y, class_names, class_weights, verbose=False)
+        return metrics['f1_macro']
+    except Exception as e:
+        print(f"Trial Pruned: {e}")
+        return 0.0
+
+if __name__ == "__main__":
+    result = load_raw_aligned_data()
+    rna_df, meth_df, cnv_df, Y, class_names, class_weights = result[0], result[1], result[2], result[3], result[4], result[5]
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(lambda t: objective(t, rna_df, meth_df, cnv_df, Y, class_names, class_weights, N_FEATURES), n_trials=50)
+    
+    print("Best params:", study.best_params)
