@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-PeromicsCMAE with Best Hyperparameters - Notebook Version
-==========================================================
+PerOmicsDAE with Best Hyperparameters - Notebook Version
+=========================================================
 This script is segmented for easy copy-paste into Jupyter notebooks.
 Each segment starts with "# " which Jupyter recognizes as a cell boundary.
+
+Uses Feature-Wise Gating and Anchor Loss architecture from Optuna optimization.
 """
 
 #  [markdown]
-# # PeromicsCMAE - Best Hyperparameters Evaluation
-# This notebook evaluates the multi-omics classification model using the best hyperparameters found by Optuna optimization.
+# # PerOmicsDAE - Best Hyperparameters Evaluation
+# This notebook evaluates the DAE-based multi-omics classification model using the best hyperparameters found by Optuna optimization.
 
 #  [markdown]
 # ## 1. Imports and Setup
@@ -25,7 +27,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-from sklearn.impute import SimpleImputer
+from sklearn.impute import KNNImputer
 from sklearn.metrics import (
     f1_score, precision_score, recall_score, 
     accuracy_score, classification_report, confusion_matrix,
@@ -38,6 +40,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
+
+# mRMR Feature Selection
+try:
+    from mrmr import mrmr_classif
+    HAS_MRMR = True
+except ImportError:
+    HAS_MRMR = False
+    print("Warning: mrmr_selection not installed. Install with: pip install mrmr_selection")
 
 # UMAP import
 try:
@@ -69,24 +79,20 @@ np.random.seed(42)
 BEST_PARAMS = {
     'n_features': 2000,
     'latent_dim': 64,
-    'hidden_dim': 64,
+    'hidden_dim': 256,
     'fusion_hidden_dim': 64,
-    'lr_pre': 0.0002146758585108322,
-    'lr_fine': 0.00011360532119650048,
-    'dropout_rate': 0.11015537480141437,
-    'dropout_encoder': 0.22590162867072883,
-    'weight_decay': 1.9336124732004638e-05,
-    'noise_level': 0.2184491078143125,
+    'lr_pre': 0.00021458006346062385,
+    'lr_fine': 0.0006664627497719737,
+    'dropout_rate': 0.16900036913444771,
+    'dropout_encoder': 0.2704898398454909,
+    'noise_level': 0.10406316876248747,
     'noise_type': 'uniform',
-    'focal_gamma': 4.050282882242696,
-    'focal_alpha_scale': 1.8214490747770962,
-    'use_class_weights': False,
-    'max_rel_gap_pre': 0.33104531983955027,
-    'max_rel_gap_fine': 0.29846272422979525,
-    'overfit_patience': 10,
-    'no_improve_patience': 46,
-    'ntxent_temperature': 0.2989172299699971,
-    'ntxent_weight': 7.766899511244319
+    'focal_gamma': 4.234547523000666,
+    'focal_alpha_scale': 2.9971972638490785,
+    'ntxent_weight': 4.917776272955244,
+    'ntxent_temperature': 0.3159090275955854,
+    'anchor_weight': 0.3705068361102422,
+    'weight_decay': 1e-4,
 }
 
 SUBTYPES_OF_INTEREST = [
@@ -98,8 +104,12 @@ SUBTYPES_OF_INTEREST = [
 
 print("Best Hyperparameters loaded!")
 print(f"  Latent Dim: {BEST_PARAMS['latent_dim']}")
+print(f"  Hidden Dim: {BEST_PARAMS['hidden_dim']}")
 print(f"  Learning Rate (Pretrain): {BEST_PARAMS['lr_pre']:.6f}")
 print(f"  Learning Rate (Fine-tune): {BEST_PARAMS['lr_fine']:.6f}")
+print(f"  Noise Level: {BEST_PARAMS['noise_level']:.4f}")
+print(f"  Noise Type: {BEST_PARAMS['noise_type']}")
+print(f"  Anchor Weight: {BEST_PARAMS['anchor_weight']:.4f}")
 
 #  [markdown]
 # ## 3. Data Loading Function
@@ -203,7 +213,7 @@ class NTXentLoss(nn.Module):
 
 
 class PerOmicCMAE(nn.Module):
-    """Per-Omic Contrastive Masked Autoencoder"""
+    """Per-Omic Denoising Autoencoder with Contrastive Learning"""
     
     def __init__(self, input_dim, latent_dim=64, hidden_dim=256, dropout_encoder=0.0):
         super().__init__()
@@ -254,13 +264,20 @@ class PerOmicCMAE(nn.Module):
         return rec, proj, z, x_corrupted
 
 
-class GatedAttentionFusion(nn.Module):
-    """Gated Attention Fusion for multi-omics"""
+class GatedFeatureFusion(nn.Module):
+    """Feature-Wise Gating for multi-omics fusion (SOTA upgrade from scalar attention)"""
     def __init__(self, latent_dim=64, num_classes=4, dropout_rate=0.3, hidden_dim=64):
         super().__init__()
-        self.gate_rna = nn.Linear(latent_dim, 1)
-        self.gate_meth = nn.Linear(latent_dim, 1)
-        self.gate_clin = nn.Linear(latent_dim, 1) 
+        # Feature-wise gates output (latent_dim), not (1)
+        self.gate_rna = nn.Linear(latent_dim, latent_dim)
+        self.gate_meth = nn.Linear(latent_dim, latent_dim)
+        self.gate_clin = nn.Linear(latent_dim, latent_dim)
+        
+        # LayerNorm is critical for stability with high gamma
+        self.ln_rna = nn.LayerNorm(latent_dim)
+        self.ln_meth = nn.LayerNorm(latent_dim)
+        self.ln_clin = nn.LayerNorm(latent_dim)
+
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim * 3, hidden_dim),
             nn.ReLU(),
@@ -270,18 +287,26 @@ class GatedAttentionFusion(nn.Module):
         self.drop_rate = dropout_rate
 
     def forward(self, z_rna, z_meth, z_clin, apply_dropout=False):
+        # Feature-wise gating (Sigmoid)
+        g_rna = torch.sigmoid(self.gate_rna(z_rna))
+        g_meth = torch.sigmoid(self.gate_meth(z_meth))
+        g_clin = torch.sigmoid(self.gate_clin(z_clin))
+
+        # Apply gates to normalized embeddings
+        h_rna = g_rna * self.ln_rna(z_rna)
+        h_meth = g_meth * self.ln_meth(z_meth)
+        h_clin = g_clin * self.ln_clin(z_clin)
+
+        # Dropout on the embeddings themselves (modality dropout)
         if apply_dropout and self.training:
-            if torch.rand(1).item() < self.drop_rate: z_rna = torch.zeros_like(z_rna)
-            if torch.rand(1).item() < self.drop_rate: z_meth = torch.zeros_like(z_meth)
-            if torch.rand(1).item() < self.drop_rate: z_clin = torch.zeros_like(z_clin)
+            if torch.rand(1).item() < self.drop_rate: h_rna = torch.zeros_like(h_rna)
+            if torch.rand(1).item() < self.drop_rate: h_meth = torch.zeros_like(h_meth)
+            if torch.rand(1).item() < self.drop_rate: h_clin = torch.zeros_like(h_clin)
 
-        w_rna = torch.sigmoid(self.gate_rna(z_rna))
-        w_meth = torch.sigmoid(self.gate_meth(z_meth))
-        w_clin = torch.sigmoid(self.gate_clin(z_clin))
-
-        z_fused = torch.cat([w_rna * z_rna, w_meth * z_meth, w_clin * z_clin], dim=1)
+        z_fused = torch.cat([h_rna, h_meth, h_clin], dim=1)
         
-        return self.classifier(z_fused), torch.cat([w_rna, w_meth, w_clin], dim=1), z_fused
+        # Return logits, gates (concatenated), and fused embedding
+        return self.classifier(z_fused), torch.cat([g_rna, g_meth, g_clin], dim=1), z_fused
 
 
 class FocalLoss(nn.Module):
@@ -342,8 +367,6 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
     Returns embeddings for all samples for visualization
     """
     
-    n_features = params['n_features']
-    
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     # Per-fold metrics
@@ -369,18 +392,15 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
     noise_type = params['noise_type']
     focal_gamma = params['focal_gamma']
     focal_alpha_scale = params['focal_alpha_scale']
-    use_class_weights = params['use_class_weights']
     weight_decay = params['weight_decay']
-    max_rel_gap_pre = params['max_rel_gap_pre']
-    max_rel_gap_fine = params['max_rel_gap_fine']
-    overfit_patience = params['overfit_patience']
-    no_improve_patience = params['no_improve_patience']
     ntxent_temp = params['ntxent_temperature']
     ntxent_weight = params['ntxent_weight']
+    anchor_weight = params['anchor_weight']
     
-    MAX_EPOCHS_PRE = 500
-    MAX_EPOCHS_FINE = 1000
-    min_lr_reductions = 2
+    MAX_EPOCHS_PRE = 700
+    MAX_EPOCHS_FINE = 1200
+    PRE_PATIENCE = 20  # For pretraining early stopping
+    FINE_PATIENCE = 30  # For fine-tuning early stopping
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(rna_df, Y)):
         print(f"\n--- Fold {fold + 1}/5 ---")
@@ -390,32 +410,100 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
         tr_meth_raw, val_meth_raw = meth_df.iloc[train_idx], meth_df.iloc[val_idx]
         tr_cnv_raw, val_cnv_raw = cnv_df.iloc[train_idx], cnv_df.iloc[val_idx]
 
-        def simple_impute_data(train_data, val_data):
-            imputer = SimpleImputer(strategy='median')
+        # --- Step 1: KNN Imputation (n_neighbors=12) - Fit on Train, Transform Both ---
+        def knn_impute_data(train_data, val_data, n_neighbors=12):
+            """KNN imputation: fit on train, transform both to avoid leakage."""
+            imputer = KNNImputer(n_neighbors=n_neighbors)
             tr_imputed = imputer.fit_transform(train_data.values)
             val_imputed = imputer.transform(val_data.values)
-            return tr_imputed, val_imputed
+            return tr_imputed, val_imputed, train_data.columns
 
-        tr_rna_imp, val_rna_imp = simple_impute_data(tr_rna_raw, val_rna_raw)
-        tr_meth_imp, val_meth_imp = simple_impute_data(tr_meth_raw, val_meth_raw)
-        tr_cnv_imp, val_cnv_imp = simple_impute_data(tr_cnv_raw, val_cnv_raw)
+        tr_rna_imp, val_rna_imp, rna_cols = knn_impute_data(tr_rna_raw, val_rna_raw, n_neighbors=12)
+        tr_meth_imp, val_meth_imp, meth_cols = knn_impute_data(tr_meth_raw, val_meth_raw, n_neighbors=12)
+        tr_cnv_imp, val_cnv_imp, cnv_cols = knn_impute_data(tr_cnv_raw, val_cnv_raw, n_neighbors=12)
+        
+        print(f"    After KNN Imputation: RNA={tr_rna_imp.shape[1]}, Meth={tr_meth_imp.shape[1]}, CNV={tr_cnv_imp.shape[1]}")
 
-        def get_top_k_indices(data, k):
-            vars = np.var(data, axis=0)
-            return np.argpartition(vars, -k)[-k:] if data.shape[1] > k else np.arange(data.shape[1])
+        # --- Step 2: Variance Filter (Top 5,000) - Fit on Train, Transform Both ---
+        VARIANCE_TOP_K = 5000
+        
+        def variance_filter(train_data, val_data, top_k, feature_names):
+            """Select top_k features by variance (computed on train only)."""
+            variances = np.var(train_data, axis=0)
+            if train_data.shape[1] > top_k:
+                top_indices = np.argpartition(variances, -top_k)[-top_k:]
+                top_indices = top_indices[np.argsort(variances[top_indices])[::-1]]  # Sort by variance descending
+            else:
+                top_indices = np.arange(train_data.shape[1])
+            tr_filtered = train_data[:, top_indices]
+            val_filtered = val_data[:, top_indices]
+            selected_features = feature_names[top_indices]
+            return tr_filtered, val_filtered, top_indices, selected_features
 
-        r_idx = get_top_k_indices(tr_rna_imp, n_features)
-        m_idx = get_top_k_indices(tr_meth_imp, n_features)
-        c_idx = get_top_k_indices(tr_cnv_imp, n_features)
+        (tr_rna_var, val_rna_var, rna_var_idx, rna_var_names) = variance_filter(
+            tr_rna_imp, val_rna_imp, VARIANCE_TOP_K, rna_cols.to_numpy()
+        )
+        (tr_meth_var, val_meth_var, meth_var_idx, meth_var_names) = variance_filter(
+            tr_meth_imp, val_meth_imp, VARIANCE_TOP_K, meth_cols.to_numpy()
+        )
+        (tr_cnv_var, val_cnv_var, cnv_var_idx, cnv_var_names) = variance_filter(
+            tr_cnv_imp, val_cnv_imp, VARIANCE_TOP_K, cnv_cols.to_numpy()
+        )
+        
+        print(f"    After Variance Filter (top {VARIANCE_TOP_K}): RNA={tr_rna_var.shape[1]}, Meth={tr_meth_var.shape[1]}, CNV={tr_cnv_var.shape[1]}")
 
-        tr_rna_sel = tr_rna_imp[:, r_idx]; val_rna_sel = val_rna_imp[:, r_idx]
-        tr_meth_sel = tr_meth_imp[:, m_idx]; val_meth_sel = val_meth_imp[:, m_idx]
-        tr_cnv_sel = tr_cnv_imp[:, c_idx]; val_cnv_sel = val_cnv_imp[:, c_idx]
+        # --- Step 3: mRMR Filter (Top 500) - Fit on Train, Transform Both ---
+        MRMR_TOP_K = 500
+        
+        def mrmr_filter(train_data, val_data, y_train, top_k, feature_names):
+            """mRMR feature selection: fit on train only, transform both."""
+            if not HAS_MRMR:
+                print("    Warning: mRMR not available, using variance filter as fallback")
+                # Fallback to variance-based selection
+                variances = np.var(train_data, axis=0)
+                if train_data.shape[1] > top_k:
+                    top_indices = np.argpartition(variances, -top_k)[-top_k:]
+                else:
+                    top_indices = np.arange(train_data.shape[1])
+                return train_data[:, top_indices], val_data[:, top_indices], top_indices
+            
+            # Convert to DataFrame for mRMR
+            train_df = pd.DataFrame(train_data, columns=feature_names)
+            y_series = pd.Series(y_train)
+            
+            # mRMR feature selection (fit on train only)
+            actual_k = min(top_k, train_data.shape[1])
+            selected_features = mrmr_classif(X=train_df, y=y_series, K=actual_k, show_progress=False)
+            
+            # Get indices of selected features
+            selected_indices = [np.where(feature_names == f)[0][0] for f in selected_features]
+            selected_indices = np.array(selected_indices)
+            
+            # Apply selection to both train and val
+            tr_filtered = train_data[:, selected_indices]
+            val_filtered = val_data[:, selected_indices]
+            
+            return tr_filtered, val_filtered, selected_indices
 
+        y_train_fold = Y[train_idx]
+        
+        tr_rna_mrmr, val_rna_mrmr, rna_mrmr_idx = mrmr_filter(
+            tr_rna_var, val_rna_var, y_train_fold, MRMR_TOP_K, rna_var_names
+        )
+        tr_meth_mrmr, val_meth_mrmr, meth_mrmr_idx = mrmr_filter(
+            tr_meth_var, val_meth_var, y_train_fold, MRMR_TOP_K, meth_var_names
+        )
+        tr_cnv_mrmr, val_cnv_mrmr, cnv_mrmr_idx = mrmr_filter(
+            tr_cnv_var, val_cnv_var, y_train_fold, MRMR_TOP_K, cnv_var_names
+        )
+        
+        print(f"    After mRMR Filter (top {MRMR_TOP_K}): RNA={tr_rna_mrmr.shape[1]}, Meth={tr_meth_mrmr.shape[1]}, CNV={tr_cnv_mrmr.shape[1]}")
+
+        # --- Step 4: Standard Scaling - Fit on Train, Transform Both ---
         sc_r = StandardScaler(); sc_m = StandardScaler(); sc_c = StandardScaler()
-        tr_rna = sc_r.fit_transform(tr_rna_sel); val_rna = sc_r.transform(val_rna_sel)
-        tr_meth = sc_m.fit_transform(tr_meth_sel); val_meth = sc_m.transform(val_meth_sel)
-        tr_cnv = sc_c.fit_transform(tr_cnv_sel); val_cnv = sc_c.transform(val_cnv_sel)
+        tr_rna = sc_r.fit_transform(tr_rna_mrmr); val_rna = sc_r.transform(val_rna_mrmr)
+        tr_meth = sc_m.fit_transform(tr_meth_mrmr); val_meth = sc_m.transform(val_meth_mrmr)
+        tr_cnv = sc_c.fit_transform(tr_cnv_mrmr); val_cnv = sc_c.transform(val_cnv_mrmr)
 
         dims = (tr_rna.shape[1], tr_meth.shape[1], tr_cnv.shape[1])
 
@@ -440,94 +528,56 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
             lr=lr_pre, weight_decay=weight_decay
         )
 
-        # --- C. Pretraining ---
+        # --- C. Pretraining with Early Stopping ---
         criterion_ntxent = NTXentLoss(temperature=ntxent_temp).to(DEVICE)
         best_pre_val_loss = float('inf')
-        best_cmae_states = None
-        overfit_counter_pre = 0
-        no_improve_counter_pre = 0
-        
-        scheduler_pre = ReduceLROnPlateau(opt_pre, mode='min', factor=0.5, 
-                                          patience=overfit_patience // 2, min_lr=1e-6)
-        lr_reductions_pre = 0
-        prev_lr_pre = lr_pre
+        patience_counter_pre = 0
 
         for epoch in range(MAX_EPOCHS_PRE):
             cmae_r.train(); cmae_m.train(); cmae_c.train()
-            rec_r1, proj_r1, _, _ = cmae_r(t_tr_r, noise_level=noise_level, noise_type=noise_type)
-            rec_m1, proj_m1, _, _ = cmae_m(t_tr_m, noise_level=noise_level, noise_type=noise_type)
-            rec_c1, proj_c1, _, _ = cmae_c(t_tr_c, noise_level=noise_level, noise_type=noise_type)
+            
+            rec_r, proj_r, _, _ = cmae_r(t_tr_r, noise_level=noise_level, noise_type=noise_type)
+            rec_m, proj_m, _, _ = cmae_m(t_tr_m, noise_level=noise_level, noise_type=noise_type)
+            rec_c, proj_c, _, _ = cmae_c(t_tr_c, noise_level=noise_level, noise_type=noise_type)
 
-            loss_recon_tr = F.mse_loss(rec_r1, t_tr_r) + F.mse_loss(rec_m1, t_tr_m) + F.mse_loss(rec_c1, t_tr_c)
-            loss_nt = (criterion_ntxent(proj_r1, proj_m1) + 
-                       criterion_ntxent(proj_r1, proj_c1) + 
-                       criterion_ntxent(proj_m1, proj_c1)) / 3.0
-            train_loss = loss_recon_tr + ntxent_weight * loss_nt
+            loss_recon = F.mse_loss(rec_r, t_tr_r) + F.mse_loss(rec_m, t_tr_m) + F.mse_loss(rec_c, t_tr_c)
+            loss_nt = (criterion_ntxent(proj_r, proj_m) + 
+                       criterion_ntxent(proj_r, proj_c) + 
+                       criterion_ntxent(proj_m, proj_c)) / 3.0
+            loss = loss_recon + ntxent_weight * loss_nt
 
             opt_pre.zero_grad()
-            train_loss.backward()
+            loss.backward()
             opt_pre.step()
 
-            cmae_r.eval(); cmae_m.eval(); cmae_c.eval()
-            with torch.no_grad():
-                rec_r_val, proj_r_val, _, _ = cmae_r(t_val_r, noise_level=0.0)
-                rec_m_val, proj_m_val, _, _ = cmae_m(t_val_m, noise_level=0.0)
-                rec_c_val, proj_c_val, _, _ = cmae_c(t_val_c, noise_level=0.0)
-                
-                loss_recon_val = F.mse_loss(rec_r_val, t_val_r) + F.mse_loss(rec_m_val, t_val_m) + F.mse_loss(rec_c_val, t_val_c)
-                loss_nt_val = (criterion_ntxent(proj_r_val, proj_m_val) + 
-                               criterion_ntxent(proj_r_val, proj_c_val) + 
-                               criterion_ntxent(proj_m_val, proj_c_val)) / 3.0
-                val_loss = loss_recon_val + ntxent_weight * loss_nt_val
-
-            val_loss_item = val_loss.item()
-            train_loss_item = train_loss.item()
+            # Validation check every 10 epochs
+            if epoch % 10 == 0:
+                cmae_r.eval(); cmae_m.eval(); cmae_c.eval()
+                with torch.no_grad():
+                    rr, rp, _, _ = cmae_r(t_val_r)
+                    mr, mp, _, _ = cmae_m(t_val_m)
+                    cr, cp, _, _ = cmae_c(t_val_c)
+                    val_loss = F.mse_loss(rr, t_val_r) + F.mse_loss(mr, t_val_m) + F.mse_loss(cr, t_val_c)
+                    
+                    if val_loss < best_pre_val_loss:
+                        best_pre_val_loss = val_loss
+                        patience_counter_pre = 0
+                    else:
+                        patience_counter_pre += 1
             
-            scheduler_pre.step(val_loss_item)
-            current_lr = opt_pre.param_groups[0]['lr']
-            if current_lr < prev_lr_pre:
-                lr_reductions_pre += 1
-                prev_lr_pre = current_lr
-            
-            rel_gap = (val_loss_item - train_loss_item) / max(train_loss_item, 0.01)
+            # Early stopping for pretraining
+            if patience_counter_pre > PRE_PATIENCE:
+                print(f"    Pretrain early stop at epoch {epoch}")
+                break
 
-            if val_loss_item < best_pre_val_loss:
-                best_pre_val_loss = val_loss_item
-                best_cmae_states = {
-                    'cmae_r': cmae_r.state_dict(),
-                    'cmae_m': cmae_m.state_dict(),
-                    'cmae_c': cmae_c.state_dict()
-                }
-                no_improve_counter_pre = 0
-            else:
-                no_improve_counter_pre += 1
-            
-            if rel_gap > max_rel_gap_pre:
-                overfit_counter_pre += 1
-            else:
-                overfit_counter_pre = 0
-            
-            if lr_reductions_pre >= min_lr_reductions:
-                if overfit_counter_pre >= overfit_patience or no_improve_counter_pre >= no_improve_patience:
-                    break
-
-        if best_cmae_states:
-            cmae_r.load_state_dict(best_cmae_states['cmae_r'])
-            cmae_m.load_state_dict(best_cmae_states['cmae_m'])
-            cmae_c.load_state_dict(best_cmae_states['cmae_c'])
-
-        # --- D. Fine-tuning ---
-        fusion = GatedAttentionFusion(
+        # --- D. Fine-tuning with Anchor Loss and Early Stopping ---
+        fusion = GatedFeatureFusion(
             latent_dim, num_classes=len(np.unique(Y)), 
             dropout_rate=dropout_rate, hidden_dim=fusion_hidden_dim
         ).to(DEVICE)
 
-        if use_class_weights:
-            alpha = torch.FloatTensor(class_weights * focal_alpha_scale).to(DEVICE)
-        else:
-            alpha = None
-            
-        criterion = FocalLoss(gamma=focal_gamma, alpha=alpha)
+        alpha = torch.FloatTensor(class_weights * focal_alpha_scale).to(DEVICE)
+        criterion_cls = FocalLoss(gamma=focal_gamma, alpha=alpha)
 
         opt_fine = optim.AdamW(
             list(cmae_r.encoder.parameters()) + list(cmae_m.encoder.parameters()) + 
@@ -535,72 +585,63 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
             lr=lr_fine, weight_decay=weight_decay
         )
 
-        scheduler_fine = ReduceLROnPlateau(opt_fine, mode='min', factor=0.5,
-                                           patience=overfit_patience // 2, min_lr=1e-7)
-        lr_reductions_fine = 0
-        prev_lr_fine = lr_fine
-
-        best_fine_val_loss = float('inf')
+        best_f1 = 0.0
         best_state = None
         best_encoder_states = None
-        overfit_counter_fine = 0
-        no_improve_counter_fine = 0
+        fine_patience_counter = 0
 
         for epoch in range(MAX_EPOCHS_FINE):
-            cmae_r.train(); cmae_m.train(); cmae_c.train()
-            fusion.train()
+            cmae_r.train(); cmae_m.train(); cmae_c.train(); fusion.train()
             
-            _, _, zr_tr, _ = cmae_r(t_tr_r, noise_level=0.0, encode_only=True)
-            _, _, zm_tr, _ = cmae_m(t_tr_m, noise_level=0.0, encode_only=True)
-            _, _, zc_tr, _ = cmae_c(t_tr_c, noise_level=0.0, encode_only=True)
+            # Anchor Loss: run with encode_only=False to get reconstruction for regularization
+            rec_r, _, zr, _ = cmae_r(t_tr_r, noise_level=0.0, encode_only=False)
+            rec_m, _, zm, _ = cmae_m(t_tr_m, noise_level=0.0, encode_only=False)
+            rec_c, _, zc, _ = cmae_c(t_tr_c, noise_level=0.0, encode_only=False)
             
-            logits, weights, _ = fusion(zr_tr, zm_tr, zc_tr, apply_dropout=True)
-            train_loss_cls = criterion(logits, t_tr_y)
+            logits, _, _ = fusion(zr, zm, zc, apply_dropout=True)
+            
+            # Primary Loss: Classification
+            loss_cls = criterion_cls(logits, t_tr_y)
+            
+            # Auxiliary Loss: Anchor (Reconstruction) to prevent forgetting manifold
+            loss_anchor = F.mse_loss(rec_r, t_tr_r) + F.mse_loss(rec_m, t_tr_m) + F.mse_loss(rec_c, t_tr_c)
+            
+            total_loss = loss_cls + (anchor_weight * loss_anchor)
+
             opt_fine.zero_grad()
-            train_loss_cls.backward()
+            total_loss.backward()
             opt_fine.step()
 
-            cmae_r.eval(); cmae_m.eval(); cmae_c.eval()
-            fusion.eval()
-            with torch.no_grad():
-                _, _, zr_val, _ = cmae_r(t_val_r, noise_level=0.0, encode_only=True)
-                _, _, zm_val, _ = cmae_m(t_val_m, noise_level=0.0, encode_only=True)
-                _, _, zc_val, _ = cmae_c(t_val_c, noise_level=0.0, encode_only=True)
-                v_logits, _, v_fused = fusion(zr_val, zm_val, zc_val, apply_dropout=False)
-                val_loss_cls = criterion(v_logits, t_val_y)
+            # Validation every 5 epochs
+            if epoch % 5 == 0:
+                cmae_r.eval(); cmae_m.eval(); cmae_c.eval(); fusion.eval()
+                with torch.no_grad():
+                    _, _, zr_v, _ = cmae_r(t_val_r, encode_only=True)
+                    _, _, zm_v, _ = cmae_m(t_val_m, encode_only=True)
+                    _, _, zc_v, _ = cmae_c(t_val_c, encode_only=True)
+                    logits_v, _, z_fused_v = fusion(zr_v, zm_v, zc_v)
+                    preds = logits_v.argmax(dim=1).cpu().numpy()
+                    targets = t_val_y.cpu().numpy()
+                    
+                    f1 = f1_score(targets, preds, average='macro')
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        fine_patience_counter = 0
+                        best_state = fusion.state_dict()
+                        best_encoder_states = {
+                            'cmae_r': cmae_r.state_dict(),
+                            'cmae_m': cmae_m.state_dict(),
+                            'cmae_c': cmae_c.state_dict()
+                        }
+                    else:
+                        fine_patience_counter += 1
+            
+            # Early stopping for fine-tuning
+            if fine_patience_counter >= FINE_PATIENCE:
+                print(f"    Fine-tune early stop at epoch {epoch}, best F1={best_f1:.4f}")
+                break
 
-            train_loss_item = val_loss_cls.item()
-            val_loss_item = val_loss_cls.item()
-            
-            scheduler_fine.step(val_loss_item)
-            current_lr = opt_fine.param_groups[0]['lr']
-            if current_lr < prev_lr_fine:
-                lr_reductions_fine += 1
-                prev_lr_fine = current_lr
-            
-            rel_gap = (val_loss_item - train_loss_item) / max(train_loss_item, 0.01)
-
-            if val_loss_item < best_fine_val_loss:
-                best_fine_val_loss = val_loss_item
-                best_state = fusion.state_dict()
-                best_encoder_states = {
-                    'cmae_r': cmae_r.state_dict(),
-                    'cmae_m': cmae_m.state_dict(),
-                    'cmae_c': cmae_c.state_dict()
-                }
-                no_improve_counter_fine = 0
-            else:
-                no_improve_counter_fine += 1
-            
-            if rel_gap > max_rel_gap_fine:
-                overfit_counter_fine += 1
-            else:
-                overfit_counter_fine = 0
-            
-            if lr_reductions_fine >= min_lr_reductions:
-                if overfit_counter_fine >= overfit_patience or no_improve_counter_fine >= no_improve_patience:
-                    break
-
+        # Load best states
         if best_state:
             fusion.load_state_dict(best_state)
         if best_encoder_states:
@@ -608,7 +649,7 @@ def run_full_evaluation(rna_df, meth_df, cnv_df, Y, T, E, class_names, class_wei
             cmae_m.load_state_dict(best_encoder_states['cmae_m'])
             cmae_c.load_state_dict(best_encoder_states['cmae_c'])
             
-        # --- E. Evaluation ---
+        # --- E. Final Evaluation ---
         cmae_r.eval(); cmae_m.eval(); cmae_c.eval()
         fusion.eval()
         with torch.no_grad():
@@ -695,16 +736,16 @@ cm = confusion_matrix(Y, all_preds)
 plt.figure(figsize=(10, 8))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
             xticklabels=class_names, yticklabels=class_names)
-plt.title('Confusion Matrix', fontsize=14, fontweight='bold')
+plt.title('Confusion Matrix (DAE Best Params)', fontsize=14, fontweight='bold')
 plt.xlabel('Predicted Label', fontsize=12)
 plt.ylabel('True Label', fontsize=12)
 plt.xticks(rotation=45, ha='right')
 plt.yticks(rotation=0)
 plt.tight_layout()
-plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.savefig('confusion_matrix_dae.png', dpi=300, bbox_inches='tight')
 plt.show()
 
-print("Confusion matrix saved to 'confusion_matrix.png'")
+print("Confusion matrix saved to 'confusion_matrix_dae.png'")
 
 #  [markdown]
 # ## 10. Clustering Analysis (K-Means)
@@ -770,7 +811,7 @@ print(f"\n{cluster_summary.to_string(index=False)}")
 # 
 # t-SNE Visualization
 print("\nComputing t-SNE...")
-tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+tsne = TSNE(n_components=2, random_state=42, perplexity=30)
 embeddings_tsne = tsne.fit_transform(all_embeddings)
 
 # Create figure with two subplots
@@ -798,10 +839,10 @@ legend2 = axes[1].legend(handles=scatter2.legend_elements()[0],
 axes[1].add_artist(legend2)
 
 plt.tight_layout()
-plt.savefig('tsne_visualization.png', dpi=300, bbox_inches='tight')
+plt.savefig('tsne_visualization_dae.png', dpi=300, bbox_inches='tight')
 plt.show()
 
-print("t-SNE visualization saved to 'tsne_visualization.png'")
+print("t-SNE visualization saved to 'tsne_visualization_dae.png'")
 
 #  [markdown]
 # ## 13. UMAP Visualization
@@ -837,10 +878,10 @@ if HAS_UMAP:
     axes[1].add_artist(legend2)
 
     plt.tight_layout()
-    plt.savefig('umap_visualization.png', dpi=300, bbox_inches='tight')
+    plt.savefig('umap_visualization_dae.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print("UMAP visualization saved to 'umap_visualization.png'")
+    print("UMAP visualization saved to 'umap_visualization_dae.png'")
 else:
     print("UMAP not available. Install with: pip install umap-learn")
 
