@@ -22,7 +22,6 @@ print("=" * 70)
 expression_data = pd.read_csv('RawData/TCGA-SARC.star_tpm.tsv', sep='\t', index_col=0)
 methylation_data = pd.read_csv('RawData/TCGA-SARC.methylation450.tsv', sep='\t', index_col=0)
 copy_number_data = pd.read_csv('RawData/TCGA-SARC.gene-level_absolute.tsv', sep='\t', index_col=0)
-protein_data = pd.read_csv('RawData/TCGA-SARC.protein.tsv', sep='\t', index_col=0)
 
 try:
     phenotype_data = pd.read_csv('RawData/TCGA-SARC.clinical.tsv', sep='\t', index_col=0)
@@ -34,7 +33,6 @@ print("Raw data shapes:")
 print(f"  Expression: {expression_data.shape}")
 print(f"  Methylation: {methylation_data.shape}")
 print(f"  Copy Number: {copy_number_data.shape}")
-print(f"  Protein: {protein_data.shape}")
 print(f"  Clinical: {phenotype_data.shape}")
 
 print("\n" + "=" * 70)
@@ -58,7 +56,6 @@ def drop_nan_and_duplicates(data, name):
 expression_data = drop_nan_and_duplicates(expression_data, "Expression")
 methylation_data = drop_nan_and_duplicates(methylation_data, "Methylation")
 copy_number_data = drop_nan_and_duplicates(copy_number_data, "Copy Number")
-protein_data = drop_nan_and_duplicates(protein_data, "Protein")
 
 print("\n" + "=" * 70)
 print("STEP 3: LOG TRANSFORMATIONS (Safe - No Data Leakage)")
@@ -79,10 +76,6 @@ cnv_clipped = cnv_filtered.clip(lower=0.05, upper=6)
 cnv_log = np.log2(cnv_clipped / 2)
 print(f"  Copy Number: Dropped genes with >20% NaN, clipped [0.05, 6], log2(x/2)")
 print(f"    Before: {copy_number_data.shape[0]} -> After: {cnv_log.shape[0]} genes")
-
-protein_filtered = protein_data.loc[protein_data.isnull().mean(axis=1) < 0.2]
-print(f"  Protein: Dropped proteins with >20% NaN")
-print(f"    Before: {protein_data.shape[0]} -> After: {protein_filtered.shape[0]} proteins")
 
 print("\n" + "=" * 70)
 print("STEP 4: PHENOTYPE PROCESSING AND SUBTYPE FILTERING")
@@ -130,9 +123,6 @@ print(f"  Saved: methylation_mvalues.csv {methylation_mvalues.shape}")
 cnv_log.to_csv(f"{OUTPUT_DIR}cnv_log.csv")
 print(f"  Saved: cnv_log.csv {cnv_log.shape}")
 
-protein_filtered.to_csv(f"{OUTPUT_DIR}protein_filtered.csv")
-print(f"  Saved: protein_filtered.csv {protein_filtered.shape}")
-
 phenotype_clean.to_csv(f"{OUTPUT_DIR}phenotype_clean.csv")
 print(f"  Saved: phenotype_clean.csv {phenotype_clean.shape}")
 
@@ -154,23 +144,20 @@ print("\nSamples per omics:")
 print(f"  Expression: {len(expression_log.columns)} samples")
 print(f"  Methylation: {len(methylation_mvalues.columns)} samples")
 print(f"  Copy Number: {len(cnv_log.columns)} samples")
-print(f"  Protein: {len(protein_filtered.columns)} samples")
 print(f"  Phenotype (with labels): {len(phenotype_clean)} samples")
 
 sample_info = pd.DataFrame({
-    'omics': ['Expression', 'Methylation', 'Copy Number', 'Protein', 'Phenotype'],
+    'omics': ['Expression', 'Methylation', 'Copy Number', 'Phenotype'],
     'n_samples': [
         len(expression_log.columns),
         len(methylation_mvalues.columns),
         len(cnv_log.columns),
-        len(protein_filtered.columns),
         len(phenotype_clean)
     ],
     'n_features': [
         expression_log.shape[0],
         methylation_mvalues.shape[0],
         cnv_log.shape[0],
-        protein_filtered.shape[0],
         phenotype_clean.shape[1]
     ]
 })
@@ -181,21 +168,13 @@ print("\nPossible omics combinations for experiments:")
 expr_samples = set(expression_log.columns)
 meth_samples = set(methylation_mvalues.columns)
 cnv_samples = set(cnv_log.columns)
-prot_samples = set(protein_filtered.columns)
 pheno_samples = set(phenotype_clean.index)
 
 combos = {
     'Expr + Meth': len(expr_samples & meth_samples & pheno_samples),
     'Expr + CNV': len(expr_samples & cnv_samples & pheno_samples),
-    'Expr + Prot': len(expr_samples & prot_samples & pheno_samples),
     'Meth + CNV': len(meth_samples & cnv_samples & pheno_samples),
-    'Meth + Prot': len(meth_samples & prot_samples & pheno_samples),
-    'CNV + Prot': len(cnv_samples & prot_samples & pheno_samples),
     'Expr + Meth + CNV': len(expr_samples & meth_samples & cnv_samples & pheno_samples),
-    'Expr + Meth + Prot': len(expr_samples & meth_samples & prot_samples & pheno_samples),
-    'Expr + CNV + Prot': len(expr_samples & cnv_samples & prot_samples & pheno_samples),
-    'Meth + CNV + Prot': len(meth_samples & cnv_samples & prot_samples & pheno_samples),
-    'All 4 Omics': len(expr_samples & meth_samples & cnv_samples & prot_samples & pheno_samples),
 }
 
 combo_df = pd.DataFrame(list(combos.items()), columns=['Combination', 'N_Samples'])
@@ -212,7 +191,6 @@ print("\nOmics files (log-transformed, ready for preprocessing):")
 print("  - expression_log.csv")
 print("  - methylation_mvalues.csv")
 print("  - cnv_log.csv")
-print("  - protein_filtered.csv")
 
 print("\nLabel/Phenotype files:")
 print("  - phenotype_clean.csv")
