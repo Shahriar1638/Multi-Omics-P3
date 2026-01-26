@@ -26,7 +26,7 @@ By employing a **Gated Attention Mechanism**, the model dynamically learns the i
 
 This project utilizes the TCGA-SARC (The Cancer Genome Atlas - Soft Tissue Sarcoma) dataset.
 
-**[[LINK TO DATASET - REPLACE WITH ORIGINAL URL](https://xenabrowser.net/datapages/?cohort=GDC%20TCGA%20Sarcoma%20(SARC)&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)]**
+**[[CLICK HERE TO DOWNLOAD THE DATASET](https://xenabrowser.net/datapages/?cohort=GDC%20TCGA%20Sarcoma%20(SARC)&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)]**
 
 ### Input Data Structure
 The notebook expects the following CSV files in a `Data/` directory:
