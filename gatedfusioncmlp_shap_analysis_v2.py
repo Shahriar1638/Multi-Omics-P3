@@ -1,39 +1,48 @@
-
 import sys
 import os
-import pandas as pd
+import random
+import time
+import warnings
+
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
 from sklearn.impute import KNNImputer
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
 from sklearn.metrics import (
     f1_score, precision_score, recall_score,
     accuracy_score, classification_report, confusion_matrix,
     silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 )
-from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-warnings.filterwarnings('ignore')
+
 from mrmr import mrmr_classif
-HAS_MRMR = True
 import umap
-HAS_UMAP = True
 import shap
-HAS_SHAP = True
 import mygene
+import cupy as cp
+
+warnings.filterwarnings('ignore')
+
+HAS_MRMR = True
+HAS_UMAP = True
+HAS_SHAP = True
 HAS_MYGENE = True
+HAS_CUPY = True
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f">>> Running on: {DEVICE}")
 SEED = 42
-import random
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -46,12 +55,9 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 seed_everything(SEED)
-import cupy as cp
-HAS_CUPY = True
 print(">>> CuPy detected. GPU mRMR enabled.")
 cp.random.seed(SEED)
 
-# --- BEST HYPERPARAMETERS (From Optuna) ---
 BEST_PARAMS = {
     'latent_dim': 32,
     'hidden_dim': 128,
@@ -210,14 +216,9 @@ def load_raw_aligned_data():
     le = LabelEncoder()
     Y = le.fit_transform(pheno[col_name])
 
-    class_counts = np.bincount(Y)
-    class_weights = len(Y) / (len(class_counts) * class_counts)
-    class_weights = class_weights / class_weights.sum()
-
-    return rna, meth, cnv, Y, le.classes_, class_weights
+    return rna, meth, cnv, Y, le.classes_
 
 # --- Advanced Feature Preparation Helpers ---
-import time
 
 def f_classif_gpu(X, y):
     """Compute ANOVA F-value on GPU."""
@@ -302,11 +303,8 @@ def variance_filter(train_vals, val_vals, top_k):
     if train_vals.shape[1] <= top_k:
         return train_vals, val_vals, np.arange(train_vals.shape[1])
 
-    # Use nanvar to be safe against NaNs
     vars = np.nanvar(train_vals, axis=0)
-    # Indices of top_k variance
     top_idx = np.argpartition(vars, -top_k)[-top_k:]
-    # Sort indices to keep order (optional but nice)
     top_idx = np.sort(top_idx)
 
     return train_vals[:, top_idx], val_vals[:, top_idx], top_idx
@@ -319,9 +317,7 @@ def mrmr_filter(train_vals, val_vals, train_y, top_k, feat_names):
     # GPU ACCELERATION
     if HAS_CUPY:
         try:
-            # print(f"   [GPU] Running mRMR on {train_vals.shape}...")
             selected_indices = mrmr_gpu_impl(train_vals, train_y, top_k)
-            # Ensure indices are python list of ints
             if hasattr(selected_indices, 'get'): selected_indices = selected_indices.get()
             selected_indices = list(selected_indices)
 
@@ -355,8 +351,7 @@ def prepare_fold_data_advanced(t_idx, v_idx, df_rna, df_meth, df_cnv, Y):
     y_tr = Y[t_idx]
 
     # 2. Variance Filter (Speed up KNN)
-    # Methylation is huge, filter heavily first. Others less so.
-    tr_r, val_r, _ = variance_filter(tr_r, val_r, top_k=5000)
+    tr_r, val_r, _ = variance_filter(tr_r, val_r, top_k=6000)
     tr_m, val_m, _ = variance_filter(tr_m, val_m, top_k=10000)
     tr_c, val_c, _ = variance_filter(tr_c, val_c, top_k=8000)
 
@@ -367,10 +362,9 @@ def prepare_fold_data_advanced(t_idx, v_idx, df_rna, df_meth, df_cnv, Y):
     tr_c = imp.fit_transform(tr_c); val_c = imp.transform(val_c)
 
     # 4. mRMR Feature Selection (Refine for Relevance)
-    # Target dimensions similar to source paper or reasonable dense input
-    tr_r, val_r, _ = mrmr_filter(tr_r, val_r, y_tr, top_k=500, feat_names=None)
+    tr_r, val_r, _ = mrmr_filter(tr_r, val_r, y_tr, top_k=350, feat_names=None)
     tr_m, val_m, _ = mrmr_filter(tr_m, val_m, y_tr, top_k=400, feat_names=None)
-    tr_c, val_c, _ = mrmr_filter(tr_c, val_c, y_tr, top_k=300, feat_names=None)
+    tr_c, val_c, _ = mrmr_filter(tr_c, val_c, y_tr, top_k=250, feat_names=None)
 
     # 5. Standard Scaling
     sc = StandardScaler()
@@ -416,6 +410,10 @@ def train_fold_single_model(tr_data, val_data, dims, params, class_weights, use_
     patience = 20
     cur_pat = 0
     best_res = None
+    
+    train_losses = []
+    val_losses = []
+    best_epoch_info = {}
 
     for epoch in range(300):
         enc_r.train(); enc_m.train(); enc_c.train(); fusion.train()
@@ -426,6 +424,7 @@ def train_fold_single_model(tr_data, val_data, dims, params, class_weights, use_
 
         logits, _ = fusion(z_r, z_m, z_c, apply_dropout=True)
         loss = criterion(logits, y_tr)
+        train_losses.append(loss.item())
 
         optimizer.zero_grad()
         loss.backward()
@@ -439,6 +438,7 @@ def train_fold_single_model(tr_data, val_data, dims, params, class_weights, use_
             v_z_c = enc_c(val_c)
             v_logits, v_latent = fusion(v_z_r, v_z_m, v_z_c)
             val_loss = criterion(v_logits, y_val).item()
+            val_losses.append(val_loss)
 
         scheduler.step(val_loss)
 
@@ -448,7 +448,13 @@ def train_fold_single_model(tr_data, val_data, dims, params, class_weights, use_
             # Save Predictions
             v_preds = v_logits.argmax(dim=1).cpu().numpy()
             v_targets = y_val.cpu().numpy()
-            v_embeddings = v_latent.cpu().numpy() # This IS the fused latent space
+            v_embeddings = v_latent.cpu().numpy()
+            
+            t_preds = logits.argmax(dim=1).detach().cpu().numpy()
+            best_epoch_info = {
+                 'train_acc': accuracy_score(y_tr.cpu().numpy(), t_preds),
+                 'val_acc': accuracy_score(y_val.cpu().numpy(), v_preds)
+            }
 
             # Save weights if gated
             current_weights = None
@@ -466,9 +472,9 @@ def train_fold_single_model(tr_data, val_data, dims, params, class_weights, use_
         if cur_pat >= patience:
             break
 
-    return best_res
+    return best_res, train_losses, val_losses, best_epoch_info
 
-def run_final_evaluation(rna_df, meth_df, cnv_df, Y, class_names, class_weights, params):
+def run_final_evaluation(rna_df, meth_df, cnv_df, Y, class_names, params):
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 
     # Storage for GATED model (Primary)
@@ -478,14 +484,20 @@ def run_final_evaluation(rna_df, meth_df, cnv_df, Y, class_names, class_weights,
     all_weights = {'RNA': np.zeros(len(Y)), 'Meth': np.zeros(len(Y)), 'CNV': np.zeros(len(Y))}
 
     metrics_gated = {'f1_macro': [], 'accuracy': [], 'precision': [], 'recall': []}
-    metrics_baseline = {'f1_macro': [], 'accuracy': [], 'precision': [], 'recall': []}
+    learning_curves = []
 
     print(f"\n{'='*60}")
-    print(f"STARTING EVALUATION (Gated vs No-Gating Baseline)")
+    print(f"STARTING EVALUATION (Gated Only)")
     print(f"{'='*60}")
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(rna_df, Y)):
         print(f"\n>>> Fold {fold+1} / 5")
+
+        # 0. Compute class weights to avoid data leakage
+        y_tr_tmp = Y[train_idx]
+        class_counts = np.bincount(y_tr_tmp)
+        class_weights = len(y_tr_tmp) / (len(class_counts) * class_counts)
+        class_weights = class_weights / class_weights.sum()
 
         # 1. Prepare Data
         (tr_r, val_r, dim_r,
@@ -499,14 +511,21 @@ def run_final_evaluation(rna_df, meth_df, cnv_df, Y, class_names, class_weights,
 
         # 2. Train Gated Model
         print("   [1] Training Gated Fusion Model...")
-        g_preds, g_targ, g_lat, g_w = train_fold_single_model(
+        best_res, t_loss, v_loss, ep_info = train_fold_single_model(
             tr_data, val_data, dims, params, class_weights, use_gating=True, class_names_len=len(class_names)
         )
+        g_preds, g_targ, g_lat, g_w = best_res
+        learning_curves.append({'train': t_loss, 'val': v_loss})
+
+        # Calculate Overfit %
+        t_acc = ep_info['train_acc']
+        v_acc = ep_info['val_acc']
+        overfit_pct = (t_acc - v_acc) * 100
 
         # Store Gated Results
         all_preds[val_idx] = g_preds
         all_targets[val_idx] = g_targ
-        all_latent[val_idx] = g_lat # Confirmed: Comes from fusion(z) -> z_fused
+        all_latent[val_idx] = g_lat
         if g_w:
             all_weights['RNA'][val_idx] = g_w['RNA']
             all_weights['Meth'][val_idx] = g_w['Meth']
@@ -517,31 +536,20 @@ def run_final_evaluation(rna_df, meth_df, cnv_df, Y, class_names, class_weights,
         metrics_gated['precision'].append(precision_score(g_targ, g_preds, average='macro'))
         metrics_gated['recall'].append(recall_score(g_targ, g_preds, average='macro'))
 
-        # 3. Train Baseline Model (No Gating)
-        print("   [2] Training Baseline (No-Gating) Model...")
-        b_preds, b_targ, _, _ = train_fold_single_model(
-            tr_data, val_data, dims, params, class_weights, use_gating=False, class_names_len=len(class_names)
-        )
-
-        metrics_baseline['f1_macro'].append(f1_score(b_targ, b_preds, average='macro'))
-        metrics_baseline['accuracy'].append(accuracy_score(b_targ, b_preds))
-        metrics_baseline['precision'].append(precision_score(b_targ, b_preds, average='macro'))
-        metrics_baseline['recall'].append(recall_score(b_targ, b_preds, average='macro'))
 
         print(f"   Fold {fold+1} Result:")
         print(f"     Gated    -> F1: {metrics_gated['f1_macro'][-1]:.4f}, Acc: {metrics_gated['accuracy'][-1]:.4f}")
-        print(f"     Baseline -> F1: {metrics_baseline['f1_macro'][-1]:.4f}, Acc: {metrics_baseline['accuracy'][-1]:.4f}")
+        print(f"     Metrics  -> Train Acc: {t_acc:.4f}, Val Acc: {v_acc:.4f} (Overfit: {overfit_pct:.2f}%)")
 
-    return metrics_gated, metrics_baseline, all_preds, all_targets, all_latent, all_weights
+    return metrics_gated, learning_curves, all_preds, all_targets, all_latent, all_weights
 
 # Load Data
 try:
-    rna_df, meth_df, cnv_df, Y, class_names, class_weights = load_raw_aligned_data()
+    rna_df, meth_df, cnv_df, Y, class_names = load_raw_aligned_data()
 
     # Run Eval
-    # Run Eval
-    metrics_gated, metrics_baseline, all_preds, all_targets, all_latent, all_weights = run_final_evaluation(
-        rna_df, meth_df, cnv_df, Y, class_names, class_weights, BEST_PARAMS
+    metrics_gated, learning_curves, all_preds, all_targets, all_latent, all_weights = run_final_evaluation(
+        rna_df, meth_df, cnv_df, Y, class_names, BEST_PARAMS
     )
 
     # helper: print stats
@@ -557,10 +565,22 @@ try:
     print("FINAL CLASSIFICATION METRICS")
     print(f"{'='*30}")
 
-    print_stats("GATED FUSION (Proposed)", metrics_gated)
-    print_stats("BASELINE (No Gating/Concatenation)", metrics_baseline)
+    print_stats("GATED FUSION", metrics_gated)
+    
+    # --- Plot Learning Curves ---
+    print("\nPlotting Learning Curves...")
+    plt.figure(figsize=(15, 8))
+    for i, curve in enumerate(learning_curves):
+        plt.subplot(2, 3, i+1)
+        plt.plot(curve['train'], label='Train Loss')
+        plt.plot(curve['val'], label='Val Loss')
+        plt.title(f'Fold {i+1} Learning Curve')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss (Focal)')
+        plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-    # --- Clustering Metrics ---
     print(f"\n{'='*30}")
     print("CLUSTERING METRICS (Latent Space)")
     print(f"{'='*30}")
@@ -595,7 +615,7 @@ z_tsne = tsne.fit_transform(all_latent)
 sns.scatterplot(
     x=z_tsne[:,0], y=z_tsne[:,1],
     hue=[class_names[int(i)] for i in all_targets],
-    palette='viridis', ax=axes[0]
+    palette='tab10', ax=axes[0]
 )
 axes[0].set_title(f't-SNE of Latent Space (True Labels)\nARI: {ari:.3f}')
 axes[0].legend(prop={'size': 8})
@@ -608,29 +628,22 @@ if HAS_UMAP:
     sns.scatterplot(
         x=z_umap[:,0], y=z_umap[:,1],
         hue=[class_names[int(i)] for i in all_targets],
-        palette='viridis', ax=axes[1]
+        palette='tab10', ax=axes[1]
     )
     axes[1].set_title(f'UMAP of Latent Space (True Labels)\nNMI: {nmi:.3f}')
     axes[1].legend(prop={'size': 8})
 else:
     axes[1].text(0.5, 0.5, 'UMAP Not Installed', ha='center')
-    plt.tight_layout()
+
+plt.tight_layout()
 # plt.savefig('cluster_analysis.png', dpi=300)
-    plt.show()
+plt.show()
 
 # --- K-Means Clustering Analysis ---
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 
 # Ensure latent data is available
 if 'all_latent' in locals():
-    print(f">>> Running Independent K-Means Clustering...")
-
-    # Determine K (number of clusters)
-    # Uses len(class_names) if available, otherwise defaults to 4
+    print(f"\n>>> Running Independent K-Means Clustering...")
     n_clusters = len(class_names) if 'class_names' in locals() else 4
     rand_seed = SEED if 'SEED' in locals() else 42
 
@@ -650,22 +663,21 @@ if 'all_latent' in locals():
         print(f"    Adjusted Rand Index (ARI):    {ari_score:.4f}")
         print(f"    Normalized Mutual Info (NMI): {nmi_score:.4f}")
 
-    # 3. Visualization
-    # Plots the K-Means clusters on top of existing UMAP or t-SNE results
     if 'z_umap' in locals():
         plt.figure(figsize=(10, 6))
-        sns.scatterplot(x=z_umap[:, 0], y=z_umap[:, 1], hue=cluster_labels, palette='viridis', s=60, legend='full')
+        sns.scatterplot(x=z_umap[:, 0], y=z_umap[:, 1], hue=cluster_labels, palette='tab10', s=60, legend='full')
         plt.title(f'K-Means Clusters on UMAP Projection (k={n_clusters})')
         plt.legend(title='Cluster')
         plt.show()
+
     elif 'z_tsne' in locals():
         plt.figure(figsize=(10, 6))
-        sns.scatterplot(x=z_tsne[:, 0], y=z_tsne[:, 1], hue=cluster_labels, palette='viridis', s=60, legend='full')
+        sns.scatterplot(x=z_tsne[:, 0], y=z_tsne[:, 1], hue=cluster_labels, palette='tab10', s=60, legend='full')
         plt.title(f'K-Means Clusters on t-SNE Projection (k={n_clusters})')
         plt.legend(title='Cluster')
         plt.show()
     else:
-        print("    Note: 'z_umap' or 'z_tsne' not found. Skipping visualization.")
+        print("Note: 'z_umap' or 'z_tsne' not found. Skipping visualization.")
 
 # --- Omics Impact Analysis ---
 if 'all_weights' in locals() and 'all_targets' in locals():
@@ -696,6 +708,7 @@ if 'all_weights' in locals() and 'all_targets' in locals():
     plt.xticks(rotation=15)
     plt.tight_layout()
     plt.show()
+
 # ==============================================================================
 # SHAP FEATURE IMPORTANCE ANALYSIS
 # ==============================================================================
@@ -708,118 +721,74 @@ if HAS_SHAP and 'rna_df' in locals():
     # --- Prepare Full Data (No CV, just for SHAP) ---
     def prepare_full_data_for_shap(df_rna, df_meth, df_cnv, Y):
         """Prepare full dataset for SHAP, returning feature names."""
-        rna_cols = df_rna.columns.tolist()
-        meth_cols = df_meth.columns.tolist()
-        cnv_cols = df_cnv.columns.tolist()
+        print(">>> Training a final model on full data for SHAP analysis (With Name Tracking)...")
 
-        X_r = df_rna.values
-        X_m = df_meth.values
-        X_c = df_cnv.values
-        
+        # 1. Initial Data & Names (Convert to Numpy for robust indexing)
+        X_r, names_r = df_rna.values, df_rna.columns.to_numpy()
+        X_m, names_m = df_meth.values, df_meth.columns.to_numpy()
+        X_c, names_c = df_cnv.values, df_cnv.columns.to_numpy()
+
         print(f"   [SHAP Prep] Initial Shapes: RNA {X_r.shape}, Meth {X_m.shape}, CNV {X_c.shape}")
 
-        # Helper to align names after filtering/changes
-        def safe_impute(X, names, omic_name="Omic"):
-            # 1. Drop all-NaN columns first to maintain name alignment
-            # This is safer than letting KNNImputer drop them implicitly
-            mask = ~np.isnan(X).all(axis=0)
-            if not np.all(mask):
-                dropped_count = np.sum(~mask)
-                print(f"   [{omic_name}] Dropping {dropped_count} all-NaN cols manually.")
-                X = X[:, mask]
-                names = [names[i] for i in range(len(names)) if mask[i]]
-            
-            # 2. Impute (keep_empty_features=True ensures X shape doesn't change unexpectedly)
-            imp = KNNImputer(n_neighbors=12, keep_empty_features=True) 
-            X = imp.fit_transform(X)
-            
-            # 3. Final verification and Padding
-            if X.shape[1] != len(names):
-                print(f"   [{omic_name}] WARNING: Mismatch! X: {X.shape}, Names: {len(names)}")
-                if len(names) < X.shape[1]:
-                    diff = X.shape[1] - len(names)
-                    print(f"   [{omic_name}] Padding names with {diff} placeholders.")
-                    names += [f"Unk_{omic_name}_{i}" for i in range(len(names), X.shape[1])]
-                else:
-                    print(f"   [{omic_name}] Trimming names.")
-                    names = names[:X.shape[1]]
-            return X, names
-
-        # Variance Filter
-        def var_filter_with_names(X, names, top_k):
-            if X.shape[1] <= top_k:
-                return X, names
+        # 2. Variance Filter
+        def apply_var_filter(X, names, top_k):
+            if X.shape[1] <= top_k: return X, names
             vars = np.nanvar(X, axis=0)
             vars = np.nan_to_num(vars, nan=-1.0)
             top_idx = np.argsort(vars)[-top_k:]
-            top_idx = np.sort(top_idx) # preserve relative order
-            return X[:, top_idx], [names[i] for i in top_idx]
+            top_idx = np.sort(top_idx) # preserve order
+            return X[:, top_idx], names[top_idx]
 
-        print("   [SHAP Prep] Variance Filtering...")
-        X_r, rna_cols = var_filter_with_names(X_r, rna_cols, 5000)
-        X_m, meth_cols = var_filter_with_names(X_m, meth_cols, 10000)
-        X_c, cnv_cols = var_filter_with_names(X_c, cnv_cols, 8000)
+        print(f"   [SHAP Prep] Variance Filter...")
+        X_r, names_r = apply_var_filter(X_r, names_r, 5000)
+        X_m, names_m = apply_var_filter(X_m, names_m, 10000)
+        X_c, names_c = apply_var_filter(X_c, names_c, 8000)
 
-        # KNN Imputation with robust name tracking
-        print("   [SHAP Prep] Imputing...")
-        X_r, rna_cols = safe_impute(X_r, rna_cols, "RNA")
-        X_m, meth_cols = safe_impute(X_m, meth_cols, "Meth")
-        X_c, cnv_cols = safe_impute(X_c, cnv_cols, "CNV")
+        # 3. Impute
+        print(f"   [SHAP Prep] Imputing...")
+        imp = KNNImputer(n_neighbors=12, keep_empty_features=True)
+        X_r = imp.fit_transform(X_r)
+        X_m = imp.fit_transform(X_m)
+        X_c = imp.fit_transform(X_c)
 
-        # mRMR Filter with names
-        def mrmr_with_names(X, y, names, top_k, omic_tag="Data"):
-            # Alignment check
-            if len(names) != X.shape[1]:
-                print(f"   [{omic_tag}] Pre-mRMR Mismatch: X {X.shape[1]}, Names {len(names)}. Fixing...")
-                if len(names) < X.shape[1]:
-                     names += [f"Unk_{i}" for i in range(len(names), X.shape[1])]
-                else:
-                     names = names[:X.shape[1]]
+        # 4. mRMR Filter
+        def apply_mrmr(X, names, y, top_k, tag):
+             if X.shape[1] <= top_k: return X, names
 
-            if X.shape[1] <= top_k:
-                return X, names
-            
-            selected_indices = None
+             # Reuse existing GPU/CPU logic to get INDICES (0..CurrentFeatures)
+             selected_indices = None
+             if HAS_CUPY:
+                 try:
+                     selected_indices = mrmr_gpu_impl(X, y, top_k)
+                     if hasattr(selected_indices, 'get'): selected_indices = selected_indices.get()
+                     selected_indices = list(selected_indices)
+                 except: pass
 
-            # GPU
-            if HAS_CUPY:
-                try:
-                    selected_indices = mrmr_gpu_impl(X, y, top_k)
-                    if hasattr(selected_indices, 'get'): selected_indices = selected_indices.get()
-                    selected_indices = list(selected_indices)
-                except Exception as e:
-                    # print(f"   [GPU mRMR Error]: {e}")
-                    pass
-            
-            # CPU mRMR
-            if selected_indices is None and HAS_MRMR:
-                try:
+             if selected_indices is None and HAS_MRMR:
+                 try:
                     df_temp = pd.DataFrame(X, columns=[f"f_{i}" for i in range(X.shape[1])])
                     selected_feats = mrmr_classif(X=df_temp, y=pd.Series(y), K=top_k, show_progress=False)
                     selected_indices = [int(f.split('_')[1]) for f in selected_feats]
-                except Exception as e:
-                    # print(f"   [CPU mRMR Error]: {e}")
-                    pass
-            
-            # Fallback: Variance
-            if selected_indices is None:
-                vars = np.nanvar(X, axis=0)
-                selected_indices = np.argsort(vars)[-top_k:]
-            
-            selected_indices = [int(i) for i in selected_indices]
-            # Verify indices are in bounds
-            max_idx = X.shape[1] - 1
-            valid_indices = [i for i in selected_indices if 0 <= i <= max_idx]
-            if len(valid_indices) != len(selected_indices):
-                print(f"   [{omic_tag}] Warning: Invalid indices detected in feature selection.")
-            
-            return X[:, valid_indices], [names[i] for i in valid_indices]
+                 except: pass
 
-        print("   [SHAP Prep] mRMR Selection...")
-        X_r, rna_cols = mrmr_with_names(X_r, Y, rna_cols, 500, "RNA")
-        X_m, meth_cols = mrmr_with_names(X_m, Y, meth_cols, 400, "Meth")
-        X_c, cnv_cols = mrmr_with_names(X_c, Y, cnv_cols, 300, "CNV")
-        
+             if selected_indices is None:
+                 vars = np.nanvar(X, axis=0)
+                 selected_indices = np.argsort(vars)[-top_k:]
+
+             selected_indices = list(selected_indices)
+             # Force Limit
+             if len(selected_indices) > top_k: selected_indices = selected_indices[:top_k]
+
+             # Convert to numpy index array
+             idx_arr = np.array(selected_indices, dtype=int)
+
+             return X[:, idx_arr], names[idx_arr]
+
+        print(f"   [SHAP Prep] mRMR...")
+        X_r, names_r = apply_mrmr(X_r, names_r, Y, 350, "RNA")
+        X_m, names_m = apply_mrmr(X_m, names_m, Y, 400, "Meth")
+        X_c, names_c = apply_mrmr(X_c, names_c, Y, 250, "CNV")
+
         print(f"   [SHAP Prep] Final Shapes: RNA {X_r.shape}, Meth {X_m.shape}, CNV {X_c.shape}")
 
         # Scale
@@ -833,8 +802,9 @@ if HAS_SHAP and 'rna_df' in locals():
             torch.FloatTensor(X_m).to(DEVICE),
             torch.FloatTensor(X_c).to(DEVICE),
             torch.LongTensor(Y).to(DEVICE),
-            rna_cols, meth_cols, cnv_cols
+            names_r.tolist(), names_m.tolist(), names_c.tolist()
         )
+
 
     X_r_full, X_m_full, X_c_full, Y_full, rna_names, meth_names, cnv_names = \
         prepare_full_data_for_shap(rna_df, meth_df, cnv_df, Y)
@@ -850,7 +820,12 @@ if HAS_SHAP and 'rna_df' in locals():
         list(enc_c_shap.parameters()) + list(fusion_shap.parameters()),
         lr=BEST_PARAMS['lr_fine'], weight_decay=BEST_PARAMS['weight_decay']
     )
-    alpha_shap = torch.FloatTensor(class_weights * BEST_PARAMS['alpha_scale']).to(DEVICE)
+    
+    class_counts_shap = np.bincount(Y)
+    class_weights_shap = len(Y) / (len(class_counts_shap) * class_counts_shap)
+    class_weights_shap = class_weights_shap / class_weights_shap.sum()
+
+    alpha_shap = torch.FloatTensor(class_weights_shap * BEST_PARAMS['alpha_scale']).to(DEVICE)
     criterion_shap = FocalLoss(gamma=BEST_PARAMS['focal_gamma'], alpha=alpha_shap)
 
     print("   Training for SHAP (100 epochs)...")
@@ -869,79 +844,7 @@ if HAS_SHAP and 'rna_df' in locals():
     # --- SHAP Analysis per Encoder ---
     enc_r_shap.eval(); enc_m_shap.eval(); enc_c_shap.eval(); fusion_shap.eval()
 
-    def get_shap_importance(encoder, fusion_model, X_data, X_r_bg, X_m_bg, X_c_bg, omic_type, feature_names, top_n=15):
-        """
-        Calculate SHAP values for a single encoder.
-        Uses GradientExplainer for neural network.
-        """
-        # Wrapper that takes one omic and uses fixed background for others
-        class EncoderWrapper(nn.Module):
-            def __init__(self, enc, fus, omic, bg_r, bg_m, bg_c):
-                super().__init__()
-                self.enc = enc
-                self.fus = fus
-                self.omic = omic
-                # Use mean of background
-                self.bg_r = bg_r.mean(0, keepdim=True)
-                self.bg_m = bg_m.mean(0, keepdim=True)
-                self.bg_c = bg_c.mean(0, keepdim=True)
 
-            def forward(self, x):
-                batch_size = x.shape[0]
-                if self.omic == 'RNA':
-                    z_r = self.enc(x)
-                    z_m = enc_m_shap(self.bg_m.expand(batch_size, -1))
-                    z_c = enc_c_shap(self.bg_c.expand(batch_size, -1))
-                elif self.omic == 'Meth':
-                    z_r = enc_r_shap(self.bg_r.expand(batch_size, -1))
-                    z_m = self.enc(x)
-                    z_c = enc_c_shap(self.bg_c.expand(batch_size, -1))
-                else:  # CNV
-                    z_r = enc_r_shap(self.bg_r.expand(batch_size, -1))
-                    z_m = enc_m_shap(self.bg_m.expand(batch_size, -1))
-                    z_c = self.enc(x)
-                logits, _ = self.fus(z_r, z_m, z_c)
-                return logits
-
-        wrapper = EncoderWrapper(encoder, fusion_model, omic_type, X_r_bg, X_m_bg, X_c_bg)
-
-        # Use a small background sample
-        bg_sample = X_data[:min(50, len(X_data))]
-
-        explainer = shap.GradientExplainer(wrapper, bg_sample)
-        shap_values = explainer.shap_values(X_data[:min(100, len(X_data))])
-
-        if shap_values is None:
-            return []
-
-        try:
-            vals = np.array(shap_values)
-        except:
-            vals = np.array(shap_values[0])
-
-        if vals.ndim == 3: # (classes, samples, features)
-            shap_abs = np.mean(np.abs(vals), axis=(0, 1))
-        elif vals.ndim == 2: # (samples, features)
-            shap_abs = np.mean(np.abs(vals), axis=0)
-        else:
-             shap_abs = np.mean(np.abs(vals.reshape(-1, vals.shape[-1])), axis=0)
-
-        shap_abs = shap_abs.flatten()
-
-        if len(shap_abs) == 0: return []
-        top_indices = np.argsort(shap_abs)[-top_n:][::-1]
-
-        top_features = []
-        for idx in top_indices:
-             i = int(idx)
-             if i < len(feature_names):
-                 top_features.append( (feature_names[i], float(shap_abs[i])) )
-             else:
-                 top_features.append( (f"Unknown_{i}", float(shap_abs[i])) )
-
-        return top_features
-
-    print("\n>>> Calculating SHAP values for RNA...")
     def get_shap_data_for_plot(encoder, fusion_model, X_data, X_r_bg, X_m_bg, X_c_bg, omic_type):
         class EncoderWrapper(nn.Module):
             def __init__(self, enc, fus, omic, bg_r, bg_m, bg_c):
@@ -970,64 +873,128 @@ if HAS_SHAP and 'rna_df' in locals():
                 return logits
 
         wrapper = EncoderWrapper(encoder, fusion_model, omic_type, X_r_bg, X_m_bg, X_c_bg)
-        bg = X_data[:min(50, len(X_data))]
+        bg   = X_data[:min(50, len(X_data))]
         test = X_data[:min(100, len(X_data))]
+        X_np = test.cpu().numpy()   # (samples, features)
+        n_samples, n_features = X_np.shape
 
         explainer = shap.GradientExplainer(wrapper, bg)
-        shap_vals = explainer.shap_values(test)
-        return shap_vals, test.cpu().numpy()
+        shap_raw  = explainer.shap_values(test)
+
+        # ---------------------------------------------------------------
+        # Determine the actual layout returned by this SHAP version.
+        # We observed: sv_plot=(500,4), X_np=(100,500)  →  shap_raw is
+        # a list of 100 arrays each (500, 4)  i.e. (features, classes),
+        # which means the full tensor is (samples, features, classes).
+        #
+        # Possible layouts:
+        #   A) list[num_classes] of (samples, features)   — classic SHAP
+        #   B) ndarray (num_classes, samples, features)   — newer SHAP
+        #   C) list[samples]    of (features, classes)    — this version!
+        #   D) ndarray (samples, features, classes)       — same as C
+        # ---------------------------------------------------------------
+        if isinstance(shap_raw, list):
+            arr = np.array(shap_raw)   # stack list → ndarray
+        else:
+            arr = np.array(shap_raw)
+
+        print(f"      [SHAP raw] shape={arr.shape}, X_np={X_np.shape}")
+
+        if arr.ndim == 2:
+            # (samples, features) — binary or single output
+            sv_3d = arr[:, :, np.newaxis]          # → (samples, features, 1)
+        elif arr.ndim == 3:
+            s0, s1, s2 = arr.shape
+            if s0 == n_samples and s1 == n_features:
+                # Layout D: (samples, features, classes)
+                sv_3d = arr
+            elif s0 == n_samples and s2 == n_features:
+                # Layout A stacked: (num_classes, samples, features) but s0==n_samples?
+                # Treat as (samples, classes, features) → transpose
+                sv_3d = arr.transpose(0, 2, 1)     # → (samples, features, classes)
+            elif s2 == n_samples and s0 == n_features:
+                # (features, classes, samples) — transpose
+                sv_3d = arr.transpose(2, 0, 1)     # → (samples, features, classes)
+            elif s0 != n_samples:
+                # Layout B: (num_classes, samples, features)
+                sv_3d = arr.transpose(1, 2, 0)     # → (samples, features, classes)
+            else:
+                sv_3d = arr                         # best guess
+        else:
+            sv_3d = arr.reshape(n_samples, n_features, -1)
+
+        # sv_3d is now (samples, features, classes)
+        sv_plot   = sv_3d[:, :, 0]                 # (samples, features) — class 0 for dot plot
+        mean_shap = np.mean(np.abs(sv_3d), axis=(0, 2))  # (features,) — avg over samples & classes
+
+        print(f"      [SHAP] sv_plot {sv_plot.shape}, X_np {X_np.shape}, mean_shap {mean_shap.shape}")
+        return sv_plot, X_np, mean_shap
 
     def process_and_plot_shap(omic_name, encoder, X_full, feat_names):
         print(f"   Generating SHAP summary for {omic_name}...")
-        shap_vals_raw, X_test_np = get_shap_data_for_plot(encoder, fusion_shap, X_full, X_r_full, X_m_full, X_c_full, omic_name)
+        n_features = X_full.shape[1]
 
-        if isinstance(shap_vals_raw, list):
-             sv = shap_vals_raw[0]
-        else:
-             sv = shap_vals_raw
+        # Safety: Ensure names match data dimensions
+        if len(feat_names) != n_features:
+            print(f"   [SHAP PLOT] Warning: Name mismatch for {omic_name}! X: {n_features}, Names: {len(feat_names)}")
+            feat_names = list(feat_names)
+            if len(feat_names) < n_features:
+                feat_names += [f"Feat_{i}" for i in range(len(feat_names), n_features)]
+            else:
+                feat_names = feat_names[:n_features]
 
-        # Gene Name Conversion
-        display_names = feat_names
+        # get_shap_data_for_plot now returns 3 values
+        sv_plot, X_test_np, mean_shap = get_shap_data_for_plot(
+            encoder, fusion_shap, X_full, X_r_full, X_m_full, X_c_full, omic_name
+        )
+        # sv_plot   : (samples, features)  — signed, for dot plot
+        # X_test_np : (samples, features)  — matching numpy data
+        # mean_shap : (features,)          — mean |SHAP| across all classes
+
+        # Gene Name Conversion (Ensembl → Symbol)
+        display_names = list(feat_names)
         if HAS_MYGENE and omic_name in ['RNA', 'CNV']:
-            # Check first few
             if len(feat_names) > 0 and (str(feat_names[0]).startswith('ENSG') or 'ENSG' in str(feat_names[0])):
-                print(f"      mapping {omic_name} Ensembl IDs to Symbols...")
+                print(f"      Mapping {omic_name} Ensembl IDs to gene symbols...")
                 mg = mygene.MyGeneInfo()
                 try:
                     res = mg.querymany(feat_names, scopes='ensembl.gene', fields='symbol', species='human', verbose=False)
-                    # Create mapping
                     mapping = {item['query']: item.get('symbol', item['query']) for item in res}
                     display_names = [mapping.get(n, n) for n in feat_names]
                 except Exception as e:
-                    print(f"      MyGene query failed: {e}")
+                    print(f"      MyGene mapping failed: {e}")
 
-        # Summary Plot
-        plt.figure(figsize=(10, 6))
-        plt.title(f"SHAP Summary: {omic_name}", fontsize=14)
-        shap.summary_plot(sv, X_test_np, feature_names=display_names, max_display=15, show=False, plot_type='dot')
-        plt.tight_layout()
-        plt.show()
+        # Summary Plot — sv_plot (samples, features) matches X_test_np exactly
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.title(f"SHAP Summary: {omic_name}", fontsize=14)
+            shap.summary_plot(sv_plot, X_test_np, feature_names=display_names,
+                              max_display=15, show=False, plot_type='dot')
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"      [SHAP Plot] summary_plot failed ({e}), falling back to bar plot.")
+            plt.figure(figsize=(10, 6))
+            plt.title(f"SHAP Feature Importance: {omic_name}", fontsize=14)
+            shap.summary_plot(sv_plot, X_test_np, feature_names=display_names,
+                              max_display=15, show=False, plot_type='bar')
+            plt.tight_layout()
+            plt.show()
 
-        if sv.ndim > 1:
-            mean_shap = np.mean(np.abs(sv), axis=0)
-        else:
-            mean_shap = np.abs(sv)
-
+        # Ensure mean_shap is exactly (n_features,)
         mean_shap = mean_shap.flatten()
+        if len(mean_shap) != n_features:
+            print(f"      [{omic_name}] WARNING: mean_shap length {len(mean_shap)} != n_features {n_features}.")
+            mean_shap = mean_shap[:n_features] if len(mean_shap) > n_features else \
+                        np.pad(mean_shap, (0, n_features - len(mean_shap)))
 
         top_ids = np.argsort(mean_shap)[-15:][::-1]
 
         print(f"\n[{omic_name} TOP 15]")
         for i, idx in enumerate(top_ids, 1):
-            # Ensure idx is a simple python int
-            idx_scalar = int(idx)
-            if idx_scalar < len(display_names):
-                vn = display_names[idx_scalar]
-            else:
-                vn = f"Unknown_Idx_{idx_scalar}"
-
-            vs = float(mean_shap[idx_scalar])
-            print(f"  {i:2d}. {vn:20s} (SHAP: {vs:.4f})")
+            idx = int(idx)
+            vn = display_names[idx] if idx < len(display_names) else f"OOB_{idx}"
+            print(f"  {i:2d}. {str(vn):25s} (SHAP: {mean_shap[idx]:.4f})")
 
     process_and_plot_shap('RNA', enc_r_shap, X_r_full, rna_names)
     process_and_plot_shap('Meth', enc_m_shap, X_m_full, meth_names)
